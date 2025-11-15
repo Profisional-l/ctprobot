@@ -710,14 +710,24 @@ def handle_my_chat_member(update):
 def main_menu(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn_plans = types.KeyboardButton("📋 Группы обучения")
-    btn_balance = types.KeyboardButton("💰 Баланс")
-    btn_ref = types.KeyboardButton("👥 Реферальная ссылка")
+    # btn_balance = types.KeyboardButton("💰 Баланс")
+    # btn_ref = types.KeyboardButton("👥 Реферальная ссылка")
     btn_sub = types.KeyboardButton("🎫 Мои подписки")
-    markup.row(btn_plans, btn_balance)
-    markup.row(btn_sub, btn_ref)
+    btn_bonus = types.KeyboardButton("🎁 Бонусная программа")  # Новая кнопка
+    # markup.row(btn_plans, btn_balance)
+    # markup.row(btn_sub, btn_ref)
+    markup.row(btn_plans)
+    markup.row(btn_sub)
+    markup.row(btn_bonus)
     if user_id in ADMIN_IDS:
         markup.row(types.KeyboardButton("⚙️ Админ меню"))
     return markup
+
+@bot.message_handler(func=lambda message: message.text == "🎁 Бонусная программа")
+# @only_private  # Убрать эту строку
+def show_bonus_program(message):
+    text = "🎁 Платим вознаграждение 40 byn за приведенного друга!"
+    bot.send_message(message.chat.id, text)
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
