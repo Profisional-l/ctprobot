@@ -573,7 +573,7 @@ def get_payment_options(user_id, plan_id):
         options.append({
             'type': 'full',
             'price': price_cents,
-            'text': f"💳 Оплатить полностью - {price_str_from_cents(price_cents)}",
+            'text': f"💳 Стоимость - {price_str_from_cents(price_cents)}",
             'description': "Доступ до 5 числа следующего месяца"
         })
         options.append({
@@ -1459,7 +1459,7 @@ def show_payment_options_with_promo(chat_id, user_id, state):
     markup = types.InlineKeyboardMarkup()
     
     if payment_options:
-        text += "<b>Доступные способы оплаты:</b>\n"
+        text += "<b>Детали</b>\n"
         
         # Получаем доступные способы оплаты
         payment_methods = get_active_payment_methods()
@@ -3354,15 +3354,15 @@ def callback_edit_plan(call):
     
     markup = types.InlineKeyboardMarkup()
     markup.row(
-        types.InlineKeyboardButton("📝 Редактировать название", callback_data=f"edit_field:title:{plan_id}"),
-        types.InlineKeyboardButton("💰 Редактировать цену", callback_data=f"edit_field:price:{plan_id}")
+        types.InlineKeyboardButton("📝 Ред. название", callback_data=f"edit_field:title:{plan_id}"),
+        types.InlineKeyboardButton("💰 Ред. цену", callback_data=f"edit_field:price:{plan_id}")
     )
     markup.row(
-        types.InlineKeyboardButton("📋 Редактировать описание", callback_data=f"edit_field:description:{plan_id}"),
+        types.InlineKeyboardButton("📋 Ред. описание", callback_data=f"edit_field:description:{plan_id}"),
         types.InlineKeyboardButton("👥 Изменить группу", callback_data=f"edit_field:group:{plan_id}")
     )
     markup.row(
-        types.InlineKeyboardButton("🖼️ Управление медиа", callback_data=f"edit_field:media:{plan_id}"),
+        types.InlineKeyboardButton("✏️🖼️ медиа", callback_data=f"edit_field:media:{plan_id}"),
         types.InlineKeyboardButton("✅ Завершить редактирование", callback_data=f"edit_finish:{plan_id}")
     )
     
