@@ -273,11 +273,14 @@ def get_default_group():
     cursor.execute("SELECT chat_id FROM managed_groups WHERE is_default=1 LIMIT 1")
     r = cursor.fetchone()
     if r:
+        logging.info(f"✅ Default group found: {r[0]}")
         return r[0]
     cursor.execute("SELECT chat_id FROM managed_groups LIMIT 1")
     r = cursor.fetchone()
     if r:
+        logging.info(f"✅ First group found: {r[0]}")
         return r[0]
+    logging.error("🚫 No groups found in database")
     return None
 
 def set_default_group(chat_id):
@@ -562,7 +565,7 @@ def get_payment_options(user_id, plan_id):
             'type': 'half_month',
             'price': first_part_price,
             'text': f"💳 Оплатить половину месяца - {price_str_from_cents(first_part_price)}",
-            'description': "Доступ до 5 числа следующего месяца (подключение после 21 числа)"
+            'description': "Доступ до 5 числа следующего месяца"
         })
         
     elif active_type == 'first':
@@ -783,29 +786,53 @@ def show_plans(message):
     
     chat_id = message.chat.id
     
-    for r in rows:
+    # Если группа всего одна - сразу показываем полную информацию
+    if len(rows) == 1:
+        r = rows[0]
         pid, title, price_cents, days, desc, media_file_id, media_type, media_file_ids, group_id, group_title = r
-        txt = f"<b>{title}</b>\n{desc}\n\n💵 Цена в месяц: {price_str_from_cents(price_cents)}"
-        if group_title:
-            txt += f"\n🏠 Группа: {group_title}"
         
+        # Получаем доступные варианты оплаты
+        payment_options = get_payment_options(message.from_user.id, pid)
+        
+        text = (f"<b>Оформление подписки на группу '{title}'</b>\n\n"
+                f"💰 Цена в месяц: {price_str_from_cents(price_cents)}\n"
+                f"📋 Описание: {desc}\n\n")
+        
+        markup = types.InlineKeyboardMarkup()
+        
+        if payment_options:
+            text += "<b>Детали:</b>\n"
+            for option in payment_options:
+                text += f"• {option['text']}\n  {option['description']}\n\n"
+            
+            for option in payment_options:
+                markup.add(types.InlineKeyboardButton(f"💸 Оплатить {price_str_from_cents(option['price'])}", callback_data=f"buy_{option['type']}:{pid}"))
+        else:
+            active_type = get_active_payment_type()
+            if active_type == 'second':
+                text += "❌ <b>У вас нет активной первой части оплаты для этой группы.</b>\n\n"
+            else:
+                text += "❌ <b>Сейчас не период оплаты.</b>\n\n"
+            
+            text += ("💳 <b>Периоды оплаты:</b>\n"
+                    "• 1-5 числа: полная оплата или первая часть\n"
+                    "• 15-20 числа: вторая часть (только при оплаченной первой)\n"
+                    "• В другое время: полная оплата\n\n"
+                    "Возвращайтесь в указанные даты!")
+        
+        # Отправляем медиа если есть
         media_ids_list = []
         if media_file_ids:
-            # Фильтруем только валидные file_id
             media_ids_list = [m.strip() for m in media_file_ids.split(",") if m.strip() and is_valid_file_id(m.strip())]
         elif media_file_id and is_valid_file_id(media_file_id.strip()):
             media_ids_list = [media_file_id.strip()]
         
         try:
-            markup = types.InlineKeyboardMarkup()
-            # Всегда показываем кнопку "Выбрать"
-            markup.add(types.InlineKeyboardButton("✅ Выбрать", callback_data=f"select_plan:{pid}"))
-            
             if len(media_ids_list) > 1:
                 media_group = []
                 valid_media_count = 0
                 
-                for m in media_ids_list[:10]:  # Ограничиваем 10 медиа
+                for m in media_ids_list[:10]:
                     if media_type == "photo":
                         media_group.append(types.InputMediaPhoto(m))
                         valid_media_count += 1
@@ -813,42 +840,200 @@ def show_plans(message):
                         media_group.append(types.InputMediaVideo(m))
                         valid_media_count += 1
                 
-                # Отправляем медиагруппу только если есть валидные медиа
                 if valid_media_count > 0:
                     if valid_media_count == 1:
-                        # Если только одно медиа, отправляем как одиночное
                         if media_type == "photo":
-                            bot.send_photo(chat_id, media_ids_list[0], caption=txt, parse_mode="HTML", reply_markup=markup)
+                            bot.send_photo(chat_id, media_ids_list[0], caption=text, parse_mode="HTML", reply_markup=markup)
                         elif media_type == "video":
-                            bot.send_video(chat_id, media_ids_list[0], caption=txt, parse_mode="HTML", reply_markup=markup)
+                            bot.send_video(chat_id, media_ids_list[0], caption=text, parse_mode="HTML", reply_markup=markup)
                     else:
-                        # Если несколько медиа, отправляем группой
                         bot.send_media_group(chat_id, media_group)
-                        bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
+                        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
                 else:
-                    # Если нет валидных медиа, отправляем только текст
-                    bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
+                    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
                     
             elif len(media_ids_list) == 1:
-                # Одно медиа
                 m = media_ids_list[0]
                 if media_type == "photo":
-                    bot.send_photo(chat_id, m, caption=txt, parse_mode="HTML", reply_markup=markup)
+                    bot.send_photo(chat_id, m, caption=text, parse_mode="HTML", reply_markup=markup)
                 elif media_type == "video":
-                    bot.send_video(chat_id, m, caption=txt, parse_mode="HTML", reply_markup=markup)
+                    bot.send_video(chat_id, m, caption=text, parse_mode="HTML", reply_markup=markup)
                 else:
-                    bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
+                    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
             else:
-                # Нет медиа
-                bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
+                bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
                 
         except Exception as e:
             logging.exception("Error sending plan media")
-            # При ошибке отправляем хотя бы текст
-            try:
-                bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=markup)
-            except:
-                pass
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+    
+    else:
+        # Если несколько групп - показываем список
+        text = "📚 <b>Доступные группы обучения</b>\n\nВыберите группу для просмотра подробной информации и оплаты:"
+        markup = types.InlineKeyboardMarkup()
+        
+        for r in rows:
+            pid, title, price_cents, days, desc, media_file_id, media_type, media_file_ids, group_id, group_title = r
+            markup.add(types.InlineKeyboardButton(f"{title}", 
+                                                callback_data=f"select_plan:{pid}"))
+        
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+
+def show_plan_full_info(chat_id, user_id, plan_id, show_back_button=True):
+    """Показывает полную информацию о группе с медиа и кнопками оплаты"""
+    cursor.execute("SELECT title, price_cents, description, group_id FROM plans WHERE id=?", (plan_id,))
+    plan = cursor.fetchone()
+    if not plan:
+        return False
+    
+    title, price_cents, description, group_id = plan
+    
+    # Получаем доступные варианты оплаты
+    payment_options = get_payment_options(user_id, plan_id)
+    
+    text = (f"💳 <b>Оформление подписки на группу '{title}'</b>\n\n"
+            f"💰 Цена в месяц: {price_str_from_cents(price_cents)}\n"
+            f"📋 Описание: {description}\n\n")
+    
+    markup = types.InlineKeyboardMarkup()
+    
+    if payment_options:
+        text += "<b>Детали:</b>\n"
+        for option in payment_options:
+            text += f"• {option['text']}\n  {option['description']}\n\n"
+        
+        # Кнопки оплаты
+        for option in payment_options:
+            markup.add(types.InlineKeyboardButton(
+                f"💸 Оплатить {price_str_from_cents(option['price'])}", 
+                callback_data=f"buy_{option['type']}:{plan_id}"
+            ))
+        
+        # Кнопка для ввода промокода
+        markup.add(types.InlineKeyboardButton("🎫 Оплатить с промокодом", callback_data=f"enter_promo_main:{plan_id}"))
+        
+    else:
+        active_type = get_active_payment_type()
+        if active_type == 'second':
+            text += "❌ <b>У вас нет активной первой части оплаты для этой группы.</b>\n\n"
+        else:
+            text += "❌ <b>Сейчас не период оплаты.</b>\n\n"
+        
+        text += ("💳 <b>Периоды оплаты:</b>\n"
+                "• 1-5 числа: полная оплата или первая часть\n"
+                "• 15-20 числа: вторая часть (только при оплаченной первой)\n"
+                "• В другое время: полная оплата\n\n"
+                "Возвращайтесь в указанные даты!")
+    
+    if show_back_button:
+        markup.add(types.InlineKeyboardButton("🔙 Назад к списку групп", callback_data="back_to_plans"))
+    
+    # Получаем медиа для этой группы
+    cursor.execute("""
+        SELECT media_file_id, media_type, media_file_ids 
+        FROM plans 
+        WHERE id=?
+    """, (plan_id,))
+    media_row = cursor.fetchone()
+    
+    if media_row:
+        media_file_id, media_type, media_file_ids = media_row
+        
+        media_ids_list = []
+        if media_file_ids:
+            media_ids_list = [m.strip() for m in media_file_ids.split(",") if m.strip() and is_valid_file_id(m.strip())]
+        elif media_file_id and is_valid_file_id(media_file_id.strip()):
+            media_ids_list = [media_file_id.strip()]
+        
+        try:
+            if len(media_ids_list) > 1:
+                media_group = []
+                valid_media_count = 0
+                
+                for m in media_ids_list[:10]:
+                    if media_type == "photo":
+                        media_group.append(types.InputMediaPhoto(m))
+                        valid_media_count += 1
+                    elif media_type == "video":
+                        media_group.append(types.InputMediaVideo(m))
+                        valid_media_count += 1
+                
+                if valid_media_count > 0:
+                    if valid_media_count == 1:
+                        if media_type == "photo":
+                            bot.send_photo(chat_id, media_ids_list[0], caption=text, parse_mode="HTML", reply_markup=markup)
+                        elif media_type == "video":
+                            bot.send_video(chat_id, media_ids_list[0], caption=text, parse_mode="HTML", reply_markup=markup)
+                    else:
+                        bot.send_media_group(chat_id, media_group)
+                        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+                else:
+                    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+                    
+            elif len(media_ids_list) == 1:
+                m = media_ids_list[0]
+                if media_type == "photo":
+                    bot.send_photo(chat_id, m, caption=text, parse_mode="HTML", reply_markup=markup)
+                elif media_type == "video":
+                    bot.send_video(chat_id, m, caption=text, parse_mode="HTML", reply_markup=markup)
+                else:
+                    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+            else:
+                bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+                
+        except Exception as e:
+            logging.exception("Error sending plan media in full info")
+            bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+    else:
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+    
+    return True
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("enter_promo_main:"))
+def callback_enter_promo_main(call):
+    try:
+        pid = int(call.data.split(":")[1])
+        user = call.from_user
+        
+        # Получаем полную информацию о группе
+        cursor.execute("SELECT title, price_cents, description, group_id FROM plans WHERE id=?", (pid,))
+        plan = cursor.fetchone()
+        if not plan:
+            bot.answer_callback_query(call.id, "❌ Группа не найдена.")
+            return
+            
+        title, price_cents, description, group_id = plan
+        
+        logging.info(f"🔍 DEBUG enter_promo_main: plan_id={pid}, group_id={group_id}")
+        
+        # Сохраняем ВСЮ информацию для возврата
+        user_states[user.id] = {
+            'plan_id': pid,
+            'title': title,
+            'description': description,
+            'original_price': price_cents,
+            'group_id': group_id,  # ⚠️ ВАЖНО: сохраняем group_id
+            'mode': 'promo_input_main',
+            'message_id': call.message.message_id
+        }
+        
+        bot.answer_callback_query(call.id, "🎫 Введите промокод")
+        
+        # Создаем клавиатуру для отмены
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(types.KeyboardButton("❌ Отмена"))
+        
+        bot.send_message(call.message.chat.id, 
+                        f"🎫 <b>Введите промокод для группы '{title}'</b>\n\n"
+                        f"💰 Исходная цена: {price_str_from_cents(price_cents)}\n\n"
+                        f"Введите промокод или нажмите '❌ Отмена'",
+                        parse_mode="HTML", 
+                        reply_markup=markup)
+        
+    except Exception as e:
+        logging.exception("Error in callback_enter_promo_main")
+        bot.answer_callback_query(call.id, "❌ Ошибка")
 
 def is_valid_file_id(file_id):
     """Проверяет валидность file_id"""
@@ -924,59 +1109,31 @@ def show_my_subscription(message):
 
 # ----------------- Payment callbacks ----------------
 @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("select_plan:"))
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("select_plan:"))
 def callback_select_plan(call):
     try:
         user = call.from_user
         pid = int(call.data.split(":")[1])
-        cursor.execute("SELECT title, price_cents, description, group_id FROM plans WHERE id=?", (pid,))
-        plan = cursor.fetchone()
-        if not plan:
+        
+        # Просто показываем полную информацию о группе
+        success = show_plan_full_info(call.message.chat.id, user.id, pid, show_back_button=True)
+        
+        if not success:
             bot.answer_callback_query(call.id, "❌ Группа не найдена.")
-            return
-        title, price_cents, description, group_id = plan
-        
-        # Получаем доступные варианты оплаты
-        payment_options = get_payment_options(user.id, pid)
-        
-        text = (f"💳 <b>Оформление подписки на группу '{title}'</b>\n\n"
-                f"💰 Цена в месяц: {price_str_from_cents(price_cents)}\n"
-                f"📋 Описание: {description}\n\n")
-        
-        markup = types.InlineKeyboardMarkup()
-        
-        if payment_options:
-            text += "<b>Доступные способы оплаты:</b>\n"
-            for option in payment_options:
-                text += f"• {option['text']}\n  {option['description']}\n\n"
-            
-            for option in payment_options:
-                markup.add(types.InlineKeyboardButton(option['text'], callback_data=f"buy_{option['type']}:{pid}"))
         else:
-            active_type = get_active_payment_type()
-            if active_type == 'second':
-                text += "❌ <b>У вас нет активной первой части оплаты для этой группы.</b>\n\n"
-            else:
-                text += "❌ <b>Сейчас не период оплаты.</b>\n\n"
-            
-            text += ("💳 <b>Периоды оплаты:</b>\n"
-                    "• 1-5 числа: полная оплата или первая часть\n"
-                    "• 15-20 числа: вторая часть (только при оплаченной первой)\n"
-                    "• В другое время: полная оплата\n\n"
-                    "Возвращайтесь в указанные даты!")
-        
-        markup.add(types.InlineKeyboardButton("🔙 Назад к списку групп", callback_data="back_to_plans"))
-        
-        bot.answer_callback_query(call.id)
-        bot.send_message(call.message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+            bot.answer_callback_query(call.id)
         
     except Exception as e:
         logging.exception("Error in callback_select_plan")
         bot.answer_callback_query(call.id, "❌ Ошибка при выборе группы")
-
+        
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_plans")
 def callback_back_to_plans(call):
     """Возврат к списку групп"""
-    show_plans(call.message)
+    try:
+           show_plans(call.message)
+    except:
+        pass
     bot.answer_callback_query(call.id)
 
 # Обработчики покупки
@@ -984,9 +1141,23 @@ def callback_back_to_plans(call):
 def callback_buy_handler(call):
     try:
         user = call.from_user
-        parts = call.data.split("_")
-        payment_type = parts[1].split(":")[0]
-        pid = int(parts[1].split(":")[1])
+        
+        # Парсим callback data в формате "buy_full:123" или "buy_partial:456"
+        callback_data = call.data
+        
+        # Разделяем на часть до : и после :
+        if ":" not in callback_data:
+            bot.answer_callback_query(call.id, "❌ Ошибка в данных.")
+            return
+            
+        buy_part, pid_str = callback_data.split(":", 1)
+        payment_type = buy_part.replace("buy_", "")
+        
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            bot.answer_callback_query(call.id, "❌ Неверный ID группы.")
+            return
         
         cursor.execute("SELECT title, price_cents, description, group_id FROM plans WHERE id=?", (pid,))
         plan = cursor.fetchone()
@@ -996,7 +1167,7 @@ def callback_buy_handler(call):
         title, price_cents, description, group_id = plan
         
         # Рассчитываем цену в зависимости от типа оплаты
-        if payment_type in ('partial', 'second_part', 'half_month'):
+        if payment_type in ('partial', 'second_part', 'half_month', 'second_part_late'):
             amount_cents = price_cents // 2
         else:  # full или full_anytime
             amount_cents = price_cents
@@ -1009,33 +1180,81 @@ def callback_buy_handler(call):
             'description': description,
             'group_id': group_id,
             'payment_type': payment_type,
-            'mode': 'promo_input'
+            'mode': 'payment_method_selection'
         }
-        
-        # Предлагаем ввести промокод
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("⏩ Пропустить промокод", callback_data=f"skip_promo:{pid}:{payment_type}"))
         
         payment_type_text = {
             'full': 'полной',
             'full_anytime': 'полной', 
             'partial': 'первой части',
-            'second_part': 'второй части'
+            'second_part': 'второй части',
+            'half_month': 'половины месяца',
+            'second_part_late': 'второй части'
         }.get(payment_type, '')
         
-        bot.answer_callback_query(call.id, "💳 Начинаем оплату...")
-        bot.send_message(call.message.chat.id, 
-                        f"💳 <b>Оплата {payment_type_text} группы '{title}'</b>\n\n"
-                        f"💰 Сумма: {price_str_from_cents(amount_cents)}\n\n"
-                        f"🎫 Если у вас есть промокод, введите его сейчас:\n"
-                        f"Или нажмите 'Пропустить промокод'", 
-                        parse_mode="HTML", reply_markup=markup)
+        # Получаем доступные способы оплаты
+        payment_methods = get_active_payment_methods()
+        if not payment_methods:
+            bot.answer_callback_query(call.id, "❌ Нет доступных способов оплаты")
+            return
+            
+        # ЕСЛИ СПОСОБ ОПЛАТЫ ВСЕГО ОДИН - СРАЗУ ПЕРЕХОДИМ К НЕМУ
+        if len(payment_methods) == 1:
+            method_id, name, mtype, method_desc, details = payment_methods[0]
+            
+            if mtype == "card":
+                # Если только карта - сразу создаем счет
+                process_card_payment(call, pid, user, title, amount_cents, description, group_id, payment_type)
+            else:
+                # Если только ручная оплата - сразу переходим к инструкциям
+                process_manual_payment_start(call, pid, user, title, amount_cents, description, details, payment_type)
+            return
+            
+        # ЕСЛИ СПОСОБОВ НЕСКОЛЬКО - показываем выбор
+        text = (f"💳 <b>Оплата {payment_type_text} группы '{title}'</b>\n\n"
+                f"💰 Сумма: {price_str_from_cents(amount_cents)}\n\n"
+                f"Выберите способ оплаты:")
+        
+        markup = types.InlineKeyboardMarkup()
+        
+        # Кнопки способов оплаты
+        for method_id, name, mtype, method_desc, details in payment_methods:
+            markup.add(types.InlineKeyboardButton(name, callback_data=f"paymethod:{pid}:{method_id}:{payment_type}"))
+        
+        # Кнопка для ввода промокода
+        markup.add(types.InlineKeyboardButton("🎫 Ввести промокод", callback_data=f"enter_promo:{pid}:{payment_type}"))
+        
+        bot.answer_callback_query(call.id, "💳 Выберите способ оплаты")
+        bot.send_message(call.message.chat.id, text, parse_mode="HTML", reply_markup=markup)
         
     except Exception as e:
         logging.exception("Error in callback_buy_handler")
         bot.answer_callback_query(call.id, "❌ Ошибка при оформлении заказа")
 
-# Продолжение в следующем сообщении из-за ограничения длины...
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("enter_promo:"))
+def callback_enter_promo(call):
+    try:
+        parts = call.data.split(":")
+        pid = int(parts[1])
+        payment_type = parts[2]
+        
+        user = call.from_user
+        
+        if user.id not in user_states:
+            bot.answer_callback_query(call.id, "❌ Сессия устарела")
+            return
+            
+        state = user_states[user.id]
+        state['mode'] = 'promo_input'
+        
+        bot.answer_callback_query(call.id, "🎫 Введите промокод")
+        bot.send_message(call.message.chat.id, 
+                        f"🎫 Введите промокод для группы '{state['title']}':\n\n"
+                        f"Или отправьте /cancel для отмены")
+        
+    except Exception as e:
+        logging.exception("Error in callback_enter_promo")
+        bot.answer_callback_query(call.id, "❌ Ошибка")
 
 # Обработчик пропуска промокода
 @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("skip_promo:"))
@@ -1053,19 +1272,22 @@ def callback_skip_promo(call):
         state = user_states[user.id]
         state['mode'] = 'no_promo'
         
-        # Показываем выбор способа оплаты
+        # Получаем доступные способы оплаты
         payment_methods = get_active_payment_methods()
         if not payment_methods:
             bot.answer_callback_query(call.id, "❌ Нет доступных способов оплаты")
             return
             
+        # ЕСЛИ СПОСОБ ОПЛАТЫ ВСЕГО ОДИН - СРАЗУ ПЕРЕХОДИМ К НЕМУ
         if len(payment_methods) == 1:
             method_id, name, mtype, method_desc, details = payment_methods[0]
+            
             if mtype == "card":
                 process_card_payment(call, pid, user, state['title'], state['original_price'], state['description'], state['group_id'], payment_type)
             else:
                 process_manual_payment_start(call, pid, user, state['title'], state['original_price'], state['description'], details, payment_type)
         else:
+            # ЕСЛИ СПОСОБОВ НЕСКОЛЬКО - показываем выбор
             markup = types.InlineKeyboardMarkup()
             for method_id, name, mtype, method_desc, details in payment_methods:
                 markup.add(types.InlineKeyboardButton(name, callback_data=f"paymethod:{pid}:{method_id}:{payment_type}"))
@@ -1078,62 +1300,399 @@ def callback_skip_promo(call):
         bot.answer_callback_query(call.id, "❌ Ошибка при оформлении заказа")
 
 # Обработчик ввода промокода
-@bot.message_handler(func=lambda m: m.from_user.id in user_states and user_states[m.from_user.id].get('mode') == 'promo_input' and m.text and not m.text.startswith('/'))
+@bot.message_handler(func=lambda m: m.from_user.id in user_states and 
+                    user_states[m.from_user.id].get('mode') in ['promo_input', 'promo_input_main'] and 
+                    m.text and not m.text.startswith('/'))
 def handle_promo_code_input(message):
     user_id = message.from_user.id
     state = user_states[user_id]
+    mode = state.get('mode')
+    
+    # Обработка отмены
+    if message.text.strip() == "❌ Отмена":
+        # Убираем клавиатуру отмены
+        markup = types.ReplyKeyboardRemove()
+        bot.send_message(message.chat.id, "❌ Ввод промокода отменен.", reply_markup=markup)
+        
+        bot.send_message(message.chat.id, "📋 Главное меню:", reply_markup=main_menu(user_id))
+        
+
+        if mode == 'promo_input_main':
+            # Возвращаемся к просмотру группы
+            show_plan_full_info(message.chat.id, user_id, state['plan_id'], show_back_button=True)
+        else:
+            # Возвращаемся к выбору способа оплаты
+            show_payment_methods(message.chat.id, user_id, state)
+        
+        user_states.pop(user_id, None)
+        return
     
     promo_code = message.text.strip().upper()
     
     # Проверяем промокод
     promo_data = get_promo_code(promo_code)
     if not promo_data:
-        bot.send_message(message.chat.id, "❌ Промокод не найден. Попробуйте другой или нажмите 'Пропустить промокод' в предыдущем сообщении.")
+        bot.send_message(message.chat.id, "❌ Промокод не найден. Попробуйте другой или нажмите '❌ Отмена'.")
         return
         
     can_use, reason = can_use_promo_code(promo_data[0], user_id)
     if not can_use:
-        bot.send_message(message.chat.id, f"❌ {reason}")
+        bot.send_message(message.chat.id, f"❌ {reason}\n\nПопробуйте другой промокод или нажмите '❌ Отмена'.")
         return
         
     # Применяем промокод
     new_price, promo_message = apply_promo_code(state['original_price'], promo_data)
-    state['promo_id'] = promo_data[0]
-    state['promo_code'] = promo_code
-    state['final_price'] = new_price
-    state['mode'] = 'promo_applied'
     
-    # Показываем выбор способа оплаты с учетом скидки
-    payment_methods = get_active_payment_methods()
-    if not payment_methods:
-        bot.send_message(message.chat.id, "❌ Нет доступных способов оплаты")
+    # ВАЖНО: Получаем актуальную информацию о группе
+    cursor.execute("SELECT group_id FROM plans WHERE id=?", (state['plan_id'],))
+    plan_data = cursor.fetchone()
+    if not plan_data:
+        bot.send_message(message.chat.id, "❌ Ошибка: группа не найдена.")
         return
         
-    text = (f"💳 <b>Оплата группы '{state['title']}'</b>\n\n"
-            f"💰 Исходная цена: {price_str_from_cents(state['original_price'])}\n"
-            f"🎫 {promo_message}\n"
-            f"💵 Итоговая цена: {price_str_from_cents(new_price)}\n\n"
-            f"Выберите способ оплаты:")
+    group_id = plan_data[0]
     
+    # Обновляем состояние ВСЕМИ необходимыми данными
+    state.update({
+        'promo_id': promo_data[0],
+        'promo_code': promo_code,
+        'final_price': new_price,
+        'group_id': group_id,  # ⚠️ ЭТОГО НЕ БЫЛО!
+        'mode': 'promo_applied'
+    })
+    
+    # Убираем клавиатуру отмены
+    markup = types.ReplyKeyboardRemove()
+    bot.send_message(message.chat.id, f"✅ {promo_message}", reply_markup=markup)
+    
+    if mode == 'promo_input_main':
+        # Переходим к выбору типа оплаты с примененным промокодом
+        state['mode'] = 'payment_method_with_promo'
+        show_payment_options_with_promo(message.chat.id, user_id, state)
+    else:
+        # Показываем способы оплаты с примененным промокодом
+        state['mode'] = 'promo_applied'
+        show_payment_methods_with_promo(message.chat.id, user_id, state)
+
+def show_payment_methods_with_promo(chat_id, user_id, state):
+    """Показывает способы оплаты с примененным промокодом"""
+    payment_methods = get_active_payment_methods()
+    if not payment_methods:
+        bot.send_message(chat_id, "❌ Нет доступных способов оплаты")
+        return
+        
+    # ЕСЛИ СПОСОБ ОПЛАТЫ ВСЕГО ОДИН - СРАЗУ ПЕРЕХОДИМ К НЕМУ
     if len(payment_methods) == 1:
         method_id, name, mtype, method_desc, details = payment_methods[0]
+        
         if mtype == "card":
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("💳 Оплатить картой", callback_data=f"pay_with_promo:{state['plan_id']}:{state['payment_type']}"))
-            bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+            # Создаем фиктивный call объект для process_card_payment
+            class FakeCall:
+                def __init__(self, chat_id):
+                    self.message = type('Message', (), {'chat': type('Chat', (), {'id': chat_id})})()
+                    self.id = "fake_call"
+            
+            fake_call = FakeCall(chat_id)
+            process_card_payment(fake_call, state['plan_id'], type('User', (), {'id': user_id})(), 
+                               state['title'], state['final_price'], state['description'], 
+                               state['group_id'], state['payment_type'], state['promo_id'])
         else:
-            process_manual_payment_start_from_message(message, state['plan_id'], state['title'], new_price, state['description'], details, state['payment_type'], state['promo_id'])
+            # Для ручной оплаты отправляем сообщение с инструкциями
+            process_manual_payment_start_from_message(
+                type('Message', (), {'chat': type('Chat', (), {'id': chat_id}), 'from_user': type('User', (), {'id': user_id})})(),
+                state['plan_id'], state['title'], state['final_price'], state['description'], 
+                details, state['payment_type'], state['promo_id']
+            )
+        return
+        
+    # ЕСЛИ СПОСОБОВ НЕСКОЛЬКО - показываем выбор
+    payment_type_text = get_payment_type_text(state['payment_type'])
+    
+    text = (f"💳 <b>Оплата {payment_type_text} группы '{state['title']}'</b>\n\n"
+            f"💰 Исходная цена: {price_str_from_cents(state['original_price'])}\n"
+            f"🎫 Промокод применен: {state['promo_code']}\n"
+            f"💵 Итоговая цена: {price_str_from_cents(state['final_price'])}\n\n"
+            f"Выберите способ оплаты:")
+    
+    markup = types.InlineKeyboardMarkup()
+    
+    for method_id, name, mtype, method_desc, details in payment_methods:
+        markup.add(types.InlineKeyboardButton(name, callback_data=f"paymethod_promo:{state['plan_id']}:{method_id}:{state['payment_type']}:{state['promo_id']}"))
+    
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+    
+def show_payment_options_with_promo(chat_id, user_id, state):
+    """Показывает варианты оплаты с примененным промокодом"""
+    plan_id = state['plan_id']
+    
+    logging.info(f"🔍 DEBUG show_payment_options_with_promo: plan_id={plan_id}, user_id={user_id}")
+    logging.info(f"🔍 DEBUG Current state: {state}")
+    
+    # ВАЖНО: Получаем актуальную информацию о группе
+    cursor.execute("SELECT title, price_cents, description, group_id FROM plans WHERE id=?", (plan_id,))
+    plan = cursor.fetchone()
+    if not plan:
+        logging.error(f"🚫 Plan {plan_id} not found in database")
+        bot.send_message(chat_id, "❌ Группа не найдена")
+        return
+        
+    title, price_cents, description, group_id = plan
+    
+    logging.info(f"🔍 DEBUG Plan data from DB: title={title}, group_id={group_id}")
+    
+    # Обновляем состояние актуальными данными
+    state.update({
+        'title': title,
+        'description': description,
+        'group_id': group_id,
+        'original_price': price_cents
+    })
+    
+    # Получаем доступные варианты оплаты
+    payment_options = get_payment_options(user_id, plan_id)
+    
+    text = (f"💳 <b>Оформление подписки на группу '{title}'</b>\n\n"
+            f"💰 Исходная цена: {price_str_from_cents(state['original_price'])}\n"
+            f"🎫 Промокод применен: {state['promo_code']}\n"
+            f"💵 Итоговая цена: {price_str_from_cents(state['final_price'])}\n\n")
+    
+    markup = types.InlineKeyboardMarkup()
+    
+    if payment_options:
+        text += "<b>Доступные способы оплаты:</b>\n"
+        
+        # Получаем доступные способы оплаты
+        payment_methods = get_active_payment_methods()
+        if not payment_methods:
+            bot.send_message(chat_id, "❌ Нет доступных способов оплаты")
+            return
+            
+        # ЕСЛИ СПОСОБ ОПЛАТЫ ВСЕГО ОДИН - СРАЗУ ПЕРЕХОДИМ К НЕМУ
+        if len(payment_methods) == 1:
+            method_id, name, mtype, method_desc, details = payment_methods[0]
+            
+            # Для каждого варианта оплаты создаем отдельную кнопку
+            for option in payment_options:
+                # Пересчитываем цену с учетом промокода для каждого варианта
+                if option['type'] in ('partial', 'second_part', 'half_month', 'second_part_late'):
+                    discounted_price = state['final_price'] // 2
+                else:
+                    discounted_price = state['final_price']
+                
+                text += f"• {option['text']} → {price_str_from_cents(discounted_price)}\n  {option['description']}\n\n"
+                
+                # Сразу переходим к оплате для единственного способа
+                if mtype == "card":
+                    # Создаем callback data для прямой оплаты картой
+                    callback_data = f"buy_with_promo:{option['type']}:{plan_id}:{state['promo_id']}"
+                    markup.add(types.InlineKeyboardButton(
+                        f"💳 Оплатить {price_str_from_cents(discounted_price)}", 
+                        callback_data=callback_data
+                    ))
+                else:
+                    # Для ручной оплаты создаем callback data для перехода к инструкциям
+                    callback_data = f"paymethod_promo:{plan_id}:{method_id}:{option['type']}:{state['promo_id']}"
+                    markup.add(types.InlineKeyboardButton(
+                        f"💳 Оплатить {price_str_from_cents(discounted_price)}", 
+                        callback_data=callback_data
+                    ))
+        else:
+            # ЕСЛИ СПОСОБОВ НЕСКОЛЬКО - создаем кнопки с выбором типа оплаты
+            for option in payment_options:
+                # Пересчитываем цену с учетом промокода для каждого варианта
+                if option['type'] in ('partial', 'second_part', 'half_month', 'second_part_late'):
+                    discounted_price = state['final_price'] // 2
+                else:
+                    discounted_price = state['final_price']
+                    
+                text += f"• {option['text']} → {price_str_from_cents(discounted_price)}\n  {option['description']}\n\n"
+                
+                # Создаем кнопку которая ведет к выбору способа оплаты
+                callback_data = f"buy_with_promo:{option['type']}:{plan_id}:{state['promo_id']}"
+                logging.info(f"🔍 DEBUG Creating payment button: {callback_data}")
+                
+                markup.add(types.InlineKeyboardButton(
+                    f"💳 Оплатить {price_str_from_cents(discounted_price)}", 
+                    callback_data=callback_data
+                ))
+        
     else:
+        active_type = get_active_payment_type()
+        if active_type == 'second':
+            text += "❌ <b>У вас нет активной первой части оплаты для этой группы.</b>\n\n"
+        else:
+            text += "❌ <b>Сейчас не период оплаты.</b>\n\n"
+        
+        text += ("💳 <b>Периоды оплаты:</b>\n"
+                "• 1-5 числа: полная оплата или первая часть\n"
+                "• 15-20 числа: вторая часть (только при оплаченной первой)\n"
+                "• В другое время: полная оплата\n\n"
+                "Возвращайтесь в указанные даты!")
+    
+    markup.add(types.InlineKeyboardButton("🔙 Назад к группе", callback_data=f"select_plan:{plan_id}"))
+    
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
+
+
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("buy_with_promo:"))
+def callback_buy_with_promo(call):
+    try:
+        user = call.from_user
+        
+        logging.info(f"🎯 buy_with_promo HANDLER TRIGGERED: {call.data}")
+        
+        # Парсим callback data в формате "buy_with_promo:full:123:456"
+        callback_data = call.data
+        
+        if ":" not in callback_data:
+            logging.error("🚫 No colon in callback data")
+            bot.answer_callback_query(call.id, "❌ Ошибка в данных.")
+            return
+            
+        parts = callback_data.split(":")
+        if len(parts) < 4:
+            logging.error(f"🚫 Invalid callback data format: {callback_data}, parts: {parts}")
+            bot.answer_callback_query(call.id, "❌ Ошибка в данных.")
+            return
+            
+        payment_type = parts[1]  # "full", "partial" и т.д.
+        pid_str = parts[2]  # ID плана
+        promo_id_str = parts[3]  # ID промокода
+        
+        try:
+            pid = int(pid_str)
+            promo_id = int(promo_id_str)
+        except ValueError as e:
+            logging.error(f"🚫 Invalid IDs in callback: pid={pid_str}, promo_id={promo_id_str}, error: {e}")
+            bot.answer_callback_query(call.id, "❌ Неверные данные.")
+            return
+        
+        logging.info(f"🔍 DEBUG Parsed successfully: pid={pid}, payment_type={payment_type}, promo_id={promo_id}")
+        
+        # ВАЖНО: Получаем полную информацию о группе
+        cursor.execute("SELECT title, price_cents, description, group_id FROM plans WHERE id=?", (pid,))
+        plan = cursor.fetchone()
+        if not plan:
+            logging.error(f"🚫 Plan {pid} not found in database")
+            bot.answer_callback_query(call.id, "❌ Группа не найдена.")
+            return
+        title, price_cents, description, group_id = plan
+        
+        logging.info(f"🔍 DEBUG Plan data: title={title}, group_id={group_id}")
+        
+        # Рассчитываем базовую цену в зависимости от типа оплаты
+        if payment_type in ('partial', 'second_part', 'half_month', 'second_part_late'):
+            original_amount = price_cents // 2
+        else:  # full или full_anytime
+            original_amount = price_cents
+        
+        # Применяем промокод к цене
+        promo_data = get_promo_code_by_id(promo_id)
+        if promo_data:
+            discounted_amount, _ = apply_promo_code(original_amount, promo_data)
+            logging.info(f"🔍 DEBUG Promo applied: {original_amount} -> {discounted_amount}")
+        else:
+            discounted_amount = original_amount
+            logging.warning(f"⚠️ Promo code {promo_id} not found, using original price")
+        
+        # ВАЖНО: Сохраняем ВСЮ информацию о группе
+        user_states[user.id] = {
+            'plan_id': pid,
+            'original_price': original_amount,
+            'final_price': discounted_amount,
+            'title': title,
+            'description': description,
+            'group_id': group_id,
+            'payment_type': payment_type,
+            'promo_id': promo_id,
+            'mode': 'payment_method_with_promo'
+        }
+        
+        logging.info(f"✅ User state saved for user {user.id}")
+        
+        # Получаем доступные способы оплаты
+        payment_methods = get_active_payment_methods()
+        if not payment_methods:
+            bot.answer_callback_query(call.id, "❌ Нет доступных способов оплаты")
+            return
+            
+        # ЕСЛИ СПОСОБ ОПЛАТЫ ВСЕГО ОДИН - СРАЗУ ПЕРЕХОДИМ К НЕМУ
+        if len(payment_methods) == 1:
+            method_id, name, mtype, method_desc, details = payment_methods[0]
+            
+            if mtype == "card":
+                # Если только карта - сразу создаем счет
+                process_card_payment(call, pid, user, title, discounted_amount, description, group_id, payment_type, promo_id)
+            else:
+                # Если только ручная оплата - сразу переходим к инструкциям
+                process_manual_payment_start(call, pid, user, title, discounted_amount, description, details, payment_type, promo_id)
+            return
+        
+        # ЕСЛИ СПОСОБОВ НЕСКОЛЬКО - показываем выбор
+        payment_type_text = get_payment_type_text(payment_type)
+        
+        text = (f"💳 <b>Оплата {payment_type_text} группы '{title}'</b>\n\n"
+                f"💰 Исходная цена: {price_str_from_cents(original_amount)}\n"
+                f"🎫 Применен промокод\n"
+                f"💵 Итоговая цена: {price_str_from_cents(discounted_amount)}\n\n"
+                f"Выберите способ оплаты:")
+        
         markup = types.InlineKeyboardMarkup()
         for method_id, name, mtype, method_desc, details in payment_methods:
-            markup.add(types.InlineKeyboardButton(name, callback_data=f"paymethod_promo:{state['plan_id']}:{method_id}:{state['payment_type']}:{state['promo_id']}"))
-        bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+            callback_data = f"paymethod_promo:{pid}:{method_id}:{payment_type}:{promo_id}"
+            logging.info(f"🔍 DEBUG Creating button: {callback_data}")
+            markup.add(types.InlineKeyboardButton(name, callback_data=callback_data))
+        
+        bot.answer_callback_query(call.id, "💳 Выберите способ оплаты")
+        bot.send_message(call.message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+        
+    except Exception as e:
+        logging.exception("Error in callback_buy_with_promo")
+        bot.answer_callback_query(call.id, "❌ Ошибка при оформлении заказа")
+
+def get_promo_code_by_id(promo_id):
+    """Получает информацию о промокоде по ID"""
+    cursor.execute("""
+        SELECT id, code, discount_percent, discount_fixed_cents, is_active, used_count, max_uses, expires_ts 
+        FROM promo_codes WHERE id=?
+    """, (promo_id,))
+    return cursor.fetchone() 
+
+def show_payment_methods(chat_id, user_id, state):
+    """Показывает способы оплаты"""
+    payment_methods = get_active_payment_methods()
+    if not payment_methods:
+        bot.send_message(chat_id, "❌ Нет доступных способов оплаты")
+        return
+        
+    payment_type_text = get_payment_type_text(state['payment_type'])
+    
+    text = (f"💳 <b>Оплата {payment_type_text} группы '{state['title']}'</b>\n\n"
+            f"💰 Сумма: {price_str_from_cents(state['original_price'])}\n\n"
+            f"Выберите способ оплаты:")
+    
+    markup = types.InlineKeyboardMarkup()
+    
+    for method_id, name, mtype, method_desc, details in payment_methods:
+        markup.add(types.InlineKeyboardButton(name, callback_data=f"paymethod:{state['plan_id']}:{method_id}:{state['payment_type']}"))
+    
+    markup.add(types.InlineKeyboardButton("🎫 Ввести промокод", callback_data=f"enter_promo:{state['plan_id']}:{state['payment_type']}"))
+    
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
 
 # Функции оплаты
 def process_card_payment(call, pid, user, title, price_cents, description, group_id, payment_type, promo_id=None):
     """Обработка оплаты картой"""
+    # ВАЖНО: Проверяем наличие group_id
     if group_id is None:
-        group_id = get_default_group()
+        # Пытаемся получить group_id из базы
+        cursor.execute("SELECT group_id FROM plans WHERE id=?", (pid,))
+        plan_data = cursor.fetchone()
+        if plan_data and plan_data[0]:
+            group_id = plan_data[0]
+        else:
+            group_id = get_default_group()
+            
     if group_id is None:
         bot.answer_callback_query(call.id, "❌ Нет доступных групп. Обратитесь к администратору.")
         return
@@ -1286,11 +1845,24 @@ def callback_paymethod_promo(call):
         
         user = call.from_user
         
-        if user.id not in user_states or 'final_price' not in user_states[user.id]:
+        logging.info(f"🔍 DEBUG paymethod_promo CALLBACK: user={user.id}, pid={pid}, method_id={method_id}, payment_type={payment_type}, promo_id={promo_id}")
+        
+        if user.id not in user_states:
+            logging.error(f"🚫 User state missing for user {user.id}")
             bot.answer_callback_query(call.id, "❌ Сессия устарела")
             return
             
         state = user_states[user.id]
+        logging.info(f"🔍 DEBUG user_state in paymethod_promo: {state}")
+        
+        # Проверяем наличие всех необходимых полей
+        required_fields = ['plan_id', 'title', 'description', 'group_id', 'final_price']
+        missing_fields = [field for field in required_fields if field not in state or state[field] is None]
+        
+        if missing_fields:
+            logging.error(f"🚫 Missing fields in user state: {missing_fields}")
+            bot.answer_callback_query(call.id, "❌ Ошибка данных. Попробуйте снова.")
+            return
         
         method = get_payment_method_by_id(method_id)
         if not method:
@@ -1298,6 +1870,8 @@ def callback_paymethod_promo(call):
             return
             
         method_id, name, mtype, method_desc, details = method
+        
+        logging.info(f"🔍 DEBUG Calling process_card_payment with: group_id={state['group_id']}")
         
         if mtype == "card":
             process_card_payment(call, pid, user, state['title'], state['final_price'], state['description'], state['group_id'], payment_type, promo_id)
@@ -1307,6 +1881,29 @@ def callback_paymethod_promo(call):
     except Exception as e:
         logging.exception("Error in callback_paymethod_promo")
         bot.answer_callback_query(call.id, "❌ Ошибка при выборе способа оплаты")
+
+# Добавьте эту временную функцию для проверки групп
+@bot.message_handler(commands=["debug_groups"])
+def debug_groups(message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+        
+    cursor.execute("SELECT chat_id, title, is_default FROM managed_groups")
+    groups = cursor.fetchall()
+    
+    text = "📋 Зарегистрированные группы:\n\n"
+    for chat_id, title, is_default in groups:
+        text += f"🏷️ {title}\nID: {chat_id}\nПо умолчанию: {'✅' if is_default else '❌'}\n\n"
+    
+    bot.send_message(message.chat.id, text)
+    
+    # Проверим конкретно группу -1002496898299
+    cursor.execute("SELECT chat_id, title FROM managed_groups WHERE chat_id = ?", (-1002496898299,))
+    group = cursor.fetchone()
+    if group:
+        bot.send_message(message.chat.id, f"✅ Группа -1002496898299 найдена: {group[1]}")
+    else:
+        bot.send_message(message.chat.id, "❌ Группа -1002496898299 НЕ найдена в базе!")
 
 @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("pay_with_promo:"))
 def callback_pay_with_promo(call):
