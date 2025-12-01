@@ -4218,7 +4218,7 @@ def check_expirations_loop():
                         # Пытаемся удалить из группы
                         if group_id:
                             try:
-                                bot.kick_chat_member(group_id, user_id)
+                                bot.ban_chat_member(group_id, user_id, until_date=int(time.time()) + 30)
                                 logging.info(f"👤 Удален пользователь {username or user_id} из группы {group_id}")
                                 time.sleep(0.1)
                             except Exception as e:
@@ -4264,7 +4264,7 @@ def check_expirations_loop():
                         # Пытаемся удалить из группы
                         if group_id:
                             try:
-                                bot.kick_chat_member(group_id, user_id)
+                                bot.ban_chat_member(group_id, user_id, until_date=int(time.time()) + 30)
                                 logging.info(f"👤 Удален пользователь {username or user_id} из группы {group_id} (частичная оплата)")
                                 time.sleep(0.1)
                             except Exception as e:
@@ -4309,7 +4309,7 @@ def check_expirations_loop():
                             # Пытаемся удалить из группы
                             if group_id:
                                 try:
-                                    bot.kick_chat_member(group_id, user_id)
+                                    bot.ban_chat_member(group_id, user_id, until_date=int(time.time()) + 30)
                                     logging.info(f"👤 Удален пользователь {username or user_id} из группы {group_id} (истек срок)")
                                     time.sleep(0.1)
                                 except Exception as e:
@@ -4792,11 +4792,11 @@ def show_edit_menu(chat_id, state):
     
     markup = types.InlineKeyboardMarkup()
     markup.row(
-        types.InlineKeyboardButton("📝 Редактировать название", callback_data=f"edit_field:title:{plan_id}"),
-        types.InlineKeyboardButton("💰 Редактировать цену", callback_data=f"edit_field:price:{plan_id}")
+        types.InlineKeyboardButton("📝 Ред. название", callback_data=f"edit_field:title:{plan_id}"),
+        types.InlineKeyboardButton("💰 Ред. цену", callback_data=f"edit_field:price:{plan_id}")
     )
     markup.row(
-        types.InlineKeyboardButton("📋 Редактировать описание", callback_data=f"edit_field:description:{plan_id}"),
+        types.InlineKeyboardButton("📋 Ред. описание", callback_data=f"edit_field:description:{plan_id}"),
         types.InlineKeyboardButton("👥 Изменить группу", callback_data=f"edit_field:group:{plan_id}")
     )
     markup.row(
