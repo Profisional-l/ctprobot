@@ -445,6 +445,15 @@ def activate_subscription(user_id, plan_id, payment_type='full', group_id=None):
     if not target_group_id:
         return False, "Не указана группа для подписки"
     
+    try:
+        # Пробуем разбанить пользователя, если он забанен
+        bot.unban_chat_member(target_group_id, user_id)
+        logging.info(f"🔄 Попытка разбанить пользователя {user_id} в группе {target_group_id}")
+    except Exception as e:
+        # Ошибка может быть если пользователь не забанен или бот не админ
+        logging.debug(f"⚠️ Не удалось разбанить пользователя {user_id}: {e}")
+    
+
     start_ts = int(time.time())
     now = now_local()
     
