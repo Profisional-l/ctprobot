@@ -3919,181 +3919,257 @@ def send_payment_notifications():
     """Отправляет уведомления о необходимости оплаты"""
     try:
         now = now_local()
+        current_day = now.day
         current_hour = now.hour
         current_minute = now.minute
         
-        # Проверяем условия ТОЛЬКО в определенное время (чтобы не выполнялось каждые 5 минут)
+        logging.info(f"🔔 Notification check: {current_day}.{now.month} {current_hour}:{current_minute}")
         
-        # 1-го числа в 10:00 - уведомление о начале периода оплаты
-        if now.day == 1 and current_hour == 10 and current_minute == 0:
-            logging.info("📢 Отправка уведомлений: 1-е число, начало месяца")
-            current_month, current_year = get_current_period()
-            
-            # Находим пользователей с активными подписками за предыдущий период
-            cursor.execute("""
-                SELECT DISTINCT s.user_id, u.username 
-                FROM subscriptions s
-                JOIN users u ON s.user_id = u.user_id
-                WHERE s.active = 1 AND (s.current_period_month != ? OR s.current_period_year != ?)
-            """, (current_month, current_year))
-            
-            users = cursor.fetchall()
-            
-            for user_id, username in users:
-                try:
-                    text = (
-                        "📅 <b>Напоминание об оплате на новый месяц</b>\n\n"
-                        "Наступил новый месяц! Для продолжения доступа к группе обучения необходимо продлить подписку.\n\n"
-                        "💳 <b>Период оплаты:</b> 1-5 число\n"
-                        "⏰ <b>До 5 числа</b> вы можете:\n"
-                        "• Оплатить полную сумму за месяц\n"
-                        "• Или оплатить первую часть (вторая часть оплачивается 15-20 числа)\n\n"
-                        "Если оплата не поступит до 5 числа 23:59, доступ к группе будет приостановлен."
-                    )
-                    
-                    markup = types.InlineKeyboardMarkup()
-                    markup.add(types.InlineKeyboardButton("🔄 Продлить подписку", callback_data="renew_subscription"))
-                    
-                    bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
-                    
-                    # Обновляем время последнего уведомления
-                    cursor.execute("""
-                        UPDATE subscriptions 
-                        SET last_notification_ts = ? 
-                        WHERE user_id = ? AND active = 1
-                    """, (int(time.time()), user_id))
-                    conn.commit()
-                    
-                    logging.info(f"📨 Отправлено уведомление пользователю {user_id}")
-                    
-                except Exception as e:
-                    logging.error(f"Error sending notification to user {user_id}: {e}")
+        # Триггеры для отправки уведомлений
+        notification_triggers = {
+            # 1-е число в 10:00 - начало месяца
+            (1, 10, 0): "first_of_month",
+            # 4-е число в 18:00 - напоминание о дедлайне первой части
+            (4, 18, 0): "first_deadline_reminder",
+            # 15-е число в 10:00 - вторая часть
+            (15, 10, 0): "second_part_start",
+            # 19-е число в 18:00 - напоминание о дедлайне второй части
+            (19, 18, 0): "second_deadline_reminder",
+        }
         
-        # 15-го числа в 10:00 - уведомление о второй части оплаты
-        elif now.day == 15 and current_hour == 10 and current_minute == 0:
-            logging.info("📢 Отправка уведомлений: 15-е число, вторая часть")
-            current_month, current_year = get_current_period()
-            
-            # Находим пользователей с оплаченной первой частью
-            cursor.execute("""
-                SELECT DISTINCT s.user_id, u.username, p.title 
-                FROM subscriptions s
-                JOIN users u ON s.user_id = u.user_id
-                JOIN plans p ON s.plan_id = p.id
-                WHERE s.active = 1 AND s.payment_type = 'partial' 
-                AND s.part_paid = 'first' 
-                AND s.current_period_month = ? AND s.current_period_year = ?
-            """, (current_month, current_year))
-            
-            users = cursor.fetchall()
-            
-            for user_id, username, plan_title in users:
-                try:
-                    cursor.execute("SELECT price_cents FROM plans WHERE id = (SELECT plan_id FROM subscriptions WHERE user_id = ? LIMIT 1)", (user_id,))
-                    price_cents = cursor.fetchone()[0]
-                    second_part_price = price_cents // 2
-                    
-                    text = (
-                        "📅 <b>Напоминание о второй части оплаты</b>\n\n"
-                        f"Группа: <b>{plan_title}</b>\n"
-                        f"💵 Сумма к оплате: {price_str_from_cents(second_part_price)}\n\n"
-                        "💳 <b>Период оплаты:</b> 15-20 число\n"
-                        "⏰ <b>До 20 числа 23:59</b> необходимо оплатить вторую часть.\n"
-                        "Если оплата не поступит, доступ к группе будет приостановлен."
-                    )
-                    
-                    markup = types.InlineKeyboardMarkup()
-                    markup.add(types.InlineKeyboardButton("💳 Оплатить вторую часть", callback_data="pay_second_part"))
-                    
-                    bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
-                    
-                    logging.info(f"📨 Отправлено уведомление о второй части пользователю {user_id}")
-                    
-                except Exception as e:
-                    logging.error(f"Error sending second part notification to user {user_id}: {e}")
-                    
-        # 4-го числа в 18:00 - Напоминание о скором дедлайне первой части
-        elif now.day == 4 and current_hour == 18 and current_minute == 0:
-            logging.info("📢 Отправка уведомлений: 4-е число, дедлайн первой части")
-            current_month, current_year = get_current_period()
-            
-            # Пользователи, которые еще не оплатили за этот месяц
-            cursor.execute("""
-                SELECT DISTINCT s.user_id, u.username 
-                FROM subscriptions s
-                JOIN users u ON s.user_id = u.user_id
-                WHERE s.active = 1 
-                AND (s.current_period_month != ? OR s.current_period_year != ? OR s.part_paid = 'none')
-            """, (current_month, current_year))
-            
-            users = cursor.fetchall()
-            
-            for user_id, username in users:
-                try:
-                    text = (
-                        "⏰ <b>Напоминание о дедлайне!</b>\n\n"
-                        "Завтра заканчивается период оплаты подписки!\n\n"
-                        "💳 <b>Успейте оплатить до 5 числа 23:59</b>\n"
-                        "• Полная оплата - доступ до 5 числа следующего месяца\n"
-                        "• Первая часть - доступ до 15 числа + вторая часть 15-20 числа\n\n"
-                        "После 5 числа доступ к группе будет приостановлен."
-                    )
-                    
-                    markup = types.InlineKeyboardMarkup()
-                    markup.add(types.InlineKeyboardButton("🔄 Продлить подписку", callback_data="renew_subscription"))
-                    
-                    bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
-                    
-                    logging.info(f"📨 Отправлено уведомление о дедлайне пользователю {user_id}")
-                    
-                except Exception as e:
-                    logging.error(f"Error sending deadline notification to user {user_id}: {e}")
+        trigger_key = (current_day, current_hour, current_minute)
         
-        # 19-го числа в 18:00 - Напоминание о скором дедлайне второй части
-        elif now.day == 19 and current_hour == 18 and current_minute == 0:
-            logging.info("📢 Отправка уведомлений: 19-е число, дедлайн второй части")
-            current_month, current_year = get_current_period()
+        if trigger_key in notification_triggers:
+            trigger_type = notification_triggers[trigger_key]
+            logging.info(f"📢 Trigger: {trigger_type}")
             
-            # Пользователи с частичной оплатой
-            cursor.execute("""
-                SELECT DISTINCT s.user_id, u.username, p.title 
-                FROM subscriptions s
-                JOIN users u ON s.user_id = u.user_id
-                JOIN plans p ON s.plan_id = p.id
-                WHERE s.active = 1 AND s.payment_type = 'partial' 
-                AND s.part_paid = 'first' 
-                AND s.current_period_month = ? AND s.current_period_year = ?
-            """, (current_month, current_year))
-            
-            users = cursor.fetchall()
-            
-            for user_id, username, plan_title in users:
-                try:
-                    cursor.execute("SELECT price_cents FROM plans WHERE id = (SELECT plan_id FROM subscriptions WHERE user_id = ? LIMIT 1)", (user_id,))
-                    price_cents = cursor.fetchone()[0]
-                    second_part_price = price_cents // 2
-                    
-                    text = (
-                        "⏰ <b>Напоминание о дедлайне второй части!</b>\n\n"
-                        f"Группа: <b>{plan_title}</b>\n"
-                        f"💵 Сумма к оплате: {price_str_from_cents(second_part_price)}\n\n"
-                        "Завтра заканчивается период оплаты второй части!\n\n"
-                        "💳 <b>Успейте оплатить до 20 числа 23:59</b>\n"
-                        "После 20 числа доступ к группе будет приостановлен."
-                    )
-                    
-                    markup = types.InlineKeyboardMarkup()
-                    markup.add(types.InlineKeyboardButton("💳 Оплатить вторую часть", callback_data="pay_second_part"))
-                    
-                    bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
-                    
-                    logging.info(f"📨 Отправлено уведомление о дедлайне второй части пользователю {user_id}")
-                    
-                except Exception as e:
-                    logging.error(f"Error sending second part deadline notification to user {user_id}: {e}")
-                    
+            if trigger_type == "first_of_month":
+                send_first_of_month_notifications(now)
+            elif trigger_type == "first_deadline_reminder":
+                send_first_deadline_notifications(now)
+            elif trigger_type == "second_part_start":
+                send_second_part_notifications(now)
+            elif trigger_type == "second_deadline_reminder":
+                send_second_deadline_notifications(now)
+                
     except Exception as e:
-        logging.error(f"Error in send_payment_notifications: {e}")
+        logging.exception(f"❌ Error in send_payment_notifications: {e}")
+
+def send_first_of_month_notifications(now):
+    """Уведомления 1-го числа"""
+    current_month, current_year = get_current_period()
+    
+    # Находим пользователей с активными подписками за предыдущий период
+    cursor.execute("""
+        SELECT DISTINCT s.user_id, u.username, p.title, s.part_paid
+        FROM subscriptions s
+        JOIN users u ON s.user_id = u.user_id
+        JOIN plans p ON s.plan_id = p.id
+        WHERE s.active = 1 
+        AND (s.current_period_month != ? OR s.current_period_year != ?)
+    """, (current_month, current_year))
+    
+    users = cursor.fetchall()
+    logging.info(f"📊 Users needing first month notification: {len(users)}")
+    
+    for user_id, username, plan_title, part_paid in users:
+        try:
+            # Пропускаем если уже есть полная оплата за этот период
+            if part_paid == 'full':
+                continue
+                
+            text = (
+                "📅 <b>Напоминание об оплате на новый месяц</b>\n\n"
+                f"Группа: <b>{plan_title}</b>\n\n"
+                "Наступил новый месяц! Для продолжения доступа к группе обучения необходимо продлить подписку.\n\n"
+                "💳 <b>Период оплаты:</b> 1-5 число\n"
+                "⏰ <b>До 5 числа 23:59</b> вы можете:\n"
+                "• Оплатить полную сумму за месяц\n"
+                "• Или оплатить первую часть (вторая часть оплачивается 15-20 числа)\n\n"
+                "Если оплата не поступит до 5 числа 23:59, доступ к группе будет приостановлен."
+            )
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔄 Продлить подписку", callback_data="renew_subscription"))
+            
+            bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+            
+            # Обновляем время последнего уведомления
+            update_notification_timestamp(user_id)
+            
+            logging.info(f"📨 Sent first month notification to user {user_id}")
+            
+        except Exception as e:
+            logging.error(f"❌ Error sending notification to user {user_id}: {e}")
+
+def send_first_deadline_notifications(now):
+    """Напоминание о дедлайне первой части (4-го числа)"""
+    current_month, current_year = get_current_period()
+    
+    # Пользователи, которые еще не оплатили за этот месяц
+    cursor.execute("""
+        SELECT DISTINCT s.user_id, u.username, p.title, s.part_paid
+        FROM subscriptions s
+        JOIN users u ON s.user_id = u.user_id
+        JOIN plans p ON s.plan_id = p.id
+        WHERE s.active = 1 
+        AND (s.current_period_month != ? OR s.current_period_year != ? OR s.part_paid = 'none')
+    """, (current_month, current_year))
+    
+    users = cursor.fetchall()
+    logging.info(f"📊 Users needing first deadline notification: {len(users)}")
+    
+    for user_id, username, plan_title, part_paid in users:
+        try:
+            # Пропускаем если уже оплачено полностью
+            if part_paid == 'full':
+                continue
+                
+            days_left = 1  # Завтра 5-е число
+            
+            text = (
+                "⏰ <b>СРОЧНО! Завтра дедлайн оплаты!</b>\n\n"
+                f"Группа: <b>{plan_title}</b>\n\n"
+                f"Завтра ({days_left} день) заканчивается период оплаты подписки!\n\n"
+                "💳 <b>Успейте оплатить до 5 числа 23:59</b>\n"
+                "• Полная оплата - доступ до 5 числа следующего месяца\n"
+                "• Первая часть - доступ до 15 числа + вторая часть 15-20 числа\n\n"
+                "После 5 числа доступ к группе будет приостановлен."
+            )
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("🔄 СРОЧНО оплатить", callback_data="renew_subscription"))
+            
+            bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+            
+            update_notification_timestamp(user_id)
+            logging.info(f"📨 Sent first deadline notification to user {user_id}")
+            
+        except Exception as e:
+            logging.error(f"❌ Error sending first deadline notification to user {user_id}: {e}")
+
+def send_second_part_notifications(now):
+    """Уведомления о второй части оплаты (15-го числа)"""
+    current_month, current_year = get_current_period()
+    
+    # Находим пользователей с оплаченной первой частью
+    cursor.execute("""
+        SELECT DISTINCT s.user_id, u.username, p.title, p.price_cents
+        FROM subscriptions s
+        JOIN users u ON s.user_id = u.user_id
+        JOIN plans p ON s.plan_id = p.id
+        WHERE s.active = 1 
+        AND s.part_paid = 'first' 
+        AND s.current_period_month = ? 
+        AND s.current_period_year = ?
+    """, (current_month, current_year))
+    
+    users = cursor.fetchall()
+    logging.info(f"📊 Users needing second part notification: {len(users)}")
+    
+    for user_id, username, plan_title, price_cents in users:
+        try:
+            second_part_price = price_cents // 2
+            days_left = 6  # С 15 по 20 числа
+            
+            text = (
+                "📅 <b>Напоминание о второй части оплаты</b>\n\n"
+                f"Группа: <b>{plan_title}</b>\n"
+                f"💰 Сумма к оплате: {price_str_from_cents(second_part_price)}\n\n"
+                "Вы успешно оплатили первую часть подписки!\n\n"
+                "💳 <b>Период оплаты второй части:</b> 15-20 число\n"
+                f"⏰ <b>Осталось дней:</b> {days_left}\n\n"
+                "Вторая часть должна быть оплачена до 20 числа 23:59.\n"
+                "Если оплата не поступит, доступ к группе будет приостановлен."
+            )
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("💳 Оплатить вторую часть", callback_data="pay_second_part"))
+            
+            bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+            
+            update_notification_timestamp(user_id)
+            logging.info(f"📨 Sent second part notification to user {user_id}")
+            
+        except Exception as e:
+            logging.error(f"❌ Error sending second part notification to user {user_id}: {e}")
+
+def send_second_deadline_notifications(now):
+    """Напоминание о дедлайне второй части (19-го числа)"""
+    current_month, current_year = get_current_period()
+    
+    # Пользователи с частичной оплатой
+    cursor.execute("""
+        SELECT DISTINCT s.user_id, u.username, p.title, p.price_cents
+        FROM subscriptions s
+        JOIN users u ON s.user_id = u.user_id
+        JOIN plans p ON s.plan_id = p.id
+        WHERE s.active = 1 
+        AND s.part_paid = 'first' 
+        AND s.current_period_month = ? 
+        AND s.current_period_year = ?
+    """, (current_month, current_year))
+    
+    users = cursor.fetchall()
+    logging.info(f"📊 Users needing second deadline notification: {len(users)}")
+    
+    for user_id, username, plan_title, price_cents in users:
+        try:
+            second_part_price = price_cents // 2
+            days_left = 1  # Завтра 20-е число
+            
+            text = (
+                "⏰ <b>СРОЧНО! Завтра дедлайн второй части!</b>\n\n"
+                f"Группа: <b>{plan_title}</b>\n"
+                f"💰 Сумма к оплате: {price_str_from_cents(second_part_price)}\n\n"
+                f"Завтра ({days_left} день) заканчивается период оплаты второй части!\n\n"
+                "💳 <b>Успейте оплатить до 20 числа 23:59</b>\n"
+                "После 20 числа доступ к группе будет приостановлен."
+            )
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("💳 СРОЧНО оплатить", callback_data="pay_second_part"))
+            
+            bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+            
+            update_notification_timestamp(user_id)
+            logging.info(f"📨 Sent second deadline notification to user {user_id}")
+            
+        except Exception as e:
+            logging.error(f"❌ Error sending second deadline notification to user {user_id}: {e}")
+
+def update_notification_timestamp(user_id):
+    """Обновляет время последнего уведомления"""
+    try:
+        cursor.execute("""
+            UPDATE subscriptions 
+            SET last_notification_ts = ? 
+            WHERE user_id = ? AND active = 1
+        """, (int(time.time()), user_id))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"❌ Error updating notification timestamp for user {user_id}: {e}")
+
+def notification_worker():
+    """Фоновый поток для проверки и отправки уведомлений"""    
+    while True:
+        try:
+            # Получаем текущее время
+            now = now_local()
+            logging.info(f"🔔 Notification check at {now.strftime('%d.%m.%Y %H:%M:%S')}")
+            
+            # Вызываем функцию уведомлений
+            send_payment_notifications()
+            
+            # Ждем 60 секунд между проверками (вместо 300, чтобы точнее ловить время)
+            time.sleep(60)
+            
+        except Exception as e:
+            logging.exception(f"❌ Error in notification worker: {e}")
+            time.sleep(60)  # Ждем минуту при ошибке
+
+# Запускаем поток уведомлений ДО запуска бота
+# threading.Thread(target=notification_worker, daemon=True).start()
 
 @bot.callback_query_handler(func=lambda call: call.data == "pay_second_part")
 def callback_pay_second_part(call):
@@ -4337,8 +4413,8 @@ def check_expirations_loop():
             logging.exception("❌ Критическая ошибка в check_expirations_loop")
             time.sleep(60)  # Ждем минуту перед повторной попыткой
 
-# Запускаем фоновые процессы
-threading.Thread(target=check_expirations_loop, daemon=True).start()
+# Запускаем фоновые процессы (теперь при запуске)
+# threading.Thread(target=check_expirations_loop, daemon=True).start()
 
 @bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("editplan:"))
 def callback_edit_plan(call):
@@ -4934,6 +5010,139 @@ def cmd_register_group(message):
         except:
             pass
 
+@bot.message_handler(commands=["test_notify"])
+@only_private
+def cmd_test_notify(message):
+    """Тест отправки уведомления"""
+    if message.from_user.id not in ADMIN_IDS:
+        bot.send_message(message.chat.id, "🚫 Доступ запрещен.")
+        return
+    
+    # Получаем текущий месяц и год
+    current_month, current_year = get_current_period()
+    
+    # Тест 1: Проверка всех пользователей, которым нужно уведомление
+    cursor.execute("""
+        SELECT COUNT(DISTINCT s.user_id)
+        FROM subscriptions s
+        WHERE s.active = 1 
+        AND (s.current_period_month != ? OR s.current_period_year != ?)
+        AND s.part_paid IN ('none', 'first')
+    """, (current_month, current_year))
+    
+    count_all = cursor.fetchone()[0]
+    
+    # Тест 2: Пользователи с первой частью оплаты
+    cursor.execute("""
+        SELECT COUNT(DISTINCT s.user_id)
+        FROM subscriptions s
+        WHERE s.active = 1 
+        AND s.part_paid = 'first' 
+        AND s.current_period_month = ? 
+        AND s.current_period_year = ?
+    """, (current_month, current_year))
+    
+    count_first_part = cursor.fetchone()[0]
+    
+    # Отправляем тестовое уведомление себе
+    try:
+        bot.send_message(message.from_user.id, 
+                        "✅ <b>Тестовое уведомление работает!</b>\n\n"
+                        "Если вы видите это сообщение, значит бот может отправлять уведомления.",
+                        parse_mode="HTML")
+        
+        # Имитация уведомления 1-го числа
+        now = now_local()
+        test_text = (
+            "📅 <b>ТЕСТ: Напоминание об оплате на новый месяц</b>\n\n"
+            f"Группа: <b>Тестовая группа</b>\n\n"
+            f"Время сервера: {now.strftime('%d.%m.%Y %H:%M:%S')}\n"
+            f"Текущий период: {current_month}.{current_year}\n\n"
+            f"Пользователей нуждается в уведомлениях: {count_all}\n"
+            f"Из них с первой частью: {count_first_part}"
+        )
+        
+        bot.send_message(message.from_user.id, test_text, parse_mode="HTML")
+        
+        # Информация в чат
+        info_text = (
+            f"📊 <b>Статистика уведомлений:</b>\n\n"
+            f"• Всего активных подписок: {cursor.execute('SELECT COUNT(*) FROM subscriptions WHERE active=1').fetchone()[0]}\n"
+            f"• Пользователей нуждается в уведомлениях: {count_all}\n"
+            f"• Из них с оплаченной первой частью: {count_first_part}\n\n"
+            f"📅 Текущий период: {current_month}.{current_year}\n"
+            f"🕐 Время сервера: {now.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+            f"🔔 Следующая проверка уведомлений через 60 секунд"
+        )
+        
+        bot.send_message(message.chat.id, info_text, parse_mode="HTML")
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка отправки теста: {str(e)}")
+
+@bot.message_handler(commands=["send_test_notifications"])
+@only_private
+def cmd_send_test_notifications(message):
+    """Отправить тестовые уведомления выбранным пользователям"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    # Получаем список тестовых пользователей (или отправляем себе)
+    test_users = [message.from_user.id]  # Отправляем себе
+    
+    for user_id in test_users:
+        try:
+            # Имитируем разные типы уведомлений
+            now = now_local()
+            current_month, current_year = get_current_period()
+            
+            texts = [
+                "📅 <b>ТЕСТ: Напоминание 1-го числа</b>\n\nНаступил новый месяц! Для продолжения доступа к группе обучения необходимо продлить подписку.",
+                "⏰ <b>ТЕСТ: Напоминание о дедлайне (4-е число)</b>\n\nЗавтра заканчивается период оплаты подписки!",
+                "📅 <b>ТЕСТ: Вторая часть оплаты (15-е число)</b>\n\nПора оплатить вторую часть подписки.",
+                "⏰ <b>ТЕСТ: Дедлайн второй части (19-е число)</b>\n\nЗавтра заканчивается период оплаты второй части!"
+            ]
+            
+            for i, text in enumerate(texts):
+                markup = types.InlineKeyboardMarkup()
+                if i % 2 == 0:
+                    markup.add(types.InlineKeyboardButton("🔄 Продлить подписку", callback_data="renew_subscription"))
+                else:
+                    markup.add(types.InlineKeyboardButton("💳 Оплатить вторую часть", callback_data="pay_second_part"))
+                
+                bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
+                time.sleep(1)  # Пауза между сообщениями
+            
+            logging.info(f"✅ Test notifications sent to user {user_id}")
+            
+        except Exception as e:
+            logging.error(f"❌ Error sending test to {user_id}: {e}")
+            bot.send_message(message.chat.id, f"❌ Ошибка отправки пользователю {user_id}: {e}")
+    
+    bot.send_message(message.chat.id, f"✅ Тестовые уведомления отправлены {len(test_users)} пользователям")
+
+@bot.message_handler(commands=["test_worker"])
+@only_private
+def cmd_test_worker(message):
+    """Тест фонового worker'а"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    # Запускаем уведомление вручную
+    bot.send_message(message.chat.id, "🔄 Запуск теста worker...")
+    
+    try:
+        now = now_local()
+        # Вызываем функцию уведомлений напрямую
+        send_payment_notifications()
+        
+        bot.send_message(message.chat.id, 
+                        f"✅ Worker вызван\n"
+                        f"Время: {now.strftime('%d.%m.%Y %H:%M:%S')}\n"
+                        f"День: {now.day}, Час: {now.hour}, Минута: {now.minute}")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
 # ----------------- Graceful shutdown -----------------
 def shutdown():
     try:
@@ -4943,12 +5152,62 @@ def shutdown():
         pass
 
 # ----------------- Run polling -----------------
+def start_bot_with_restart():
+    """Запуск бота с автоперезапуском при падении"""
+    restart_attempts = 0
+    max_restart_attempts = 10
+    
+    workers_started = False
+    
+    while True:
+        try:
+            if not workers_started:
+                logging.info("🚀 Initializing bot...")
+                
+                # Запускаем worker'ов только один раз
+                threading.Thread(target=check_expirations_loop, daemon=True).start()
+                logging.info("🔄 Expiration worker started")
+                
+                threading.Thread(target=notification_worker, daemon=True).start()
+                logging.info("🔔 Notification worker started")
+                
+                workers_started = True
+            
+            # ОСНОВНОЙ polling с правильными параметрами
+            logging.info("🤖 Starting bot polling...")
+            bot.infinity_polling(
+                timeout=20, 
+                long_polling_timeout=15,
+                logger_level=logging.ERROR,  # Уменьшаем логирование telebot
+                allowed_updates=['message', 'edited_message', 'callback_query', 
+                               'my_chat_member', 'chat_member', 'inline_query', 
+                               'pre_checkout_query', 'shipping_query'],
+                skip_pending=True  # Пропускаем старые апдейты при перезапуске
+            )
+            
+            # Если infinity_polling завершился без исключения - выходим
+            logging.info("✅ Polling stopped gracefully")
+            break
+            
+        except KeyboardInterrupt:
+            # Телебот уже поймал KeyboardInterrupt и завершил polling
+            logging.info("👋 Bot stopped by user (KeyboardInterrupt)")
+            return
+            
+        except Exception as e:
+            # Любые другие ошибки - перезапускаем
+            restart_attempts += 1
+            logging.exception(f"❌ Polling crashed! Attempt {restart_attempts}/{max_restart_attempts}")
+            
+            if restart_attempts >= max_restart_attempts:
+                logging.error(f"🚨 Too many crashes. Stopping.")
+                return
+                
+            logging.info(f"🔄 Restarting in 5 seconds...")
+            time.sleep(5)
+    
+    logging.info("🎉 Bot shutdown complete")
+
 if __name__ == "__main__":
     logging.info("Starting student control bot...")
-    try:
-        bot.infinity_polling(timeout=60, long_polling_timeout=60,
-                             allowed_updates=['message', 'edited_message', 'callback_query', 'my_chat_member', 'chat_member', 'inline_query', 'pre_checkout_query', 'shipping_query'])
-    except KeyboardInterrupt:
-        shutdown()
-    except Exception:
-        logging.exception("Bot crashed; shutting down")
+    start_bot_with_restart()
