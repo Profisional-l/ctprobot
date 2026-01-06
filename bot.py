@@ -16,6 +16,8 @@ import logging
 import re
 import random
 import string
+import html
+from collections import deque
 from datetime import datetime, timedelta, timezone
 import calendar
 import pytz
@@ -38,6 +40,12 @@ REFERRAL_PERCENT = int(os.environ.get("REFERRAL_PERCENT", "10"))
 CHECK_INTERVAL_SECONDS = int(os.environ.get("CHECK_INTERVAL_SECONDS", "300"))
 DB_PATH = os.environ.get("DB_PATH", "student_bot.db")
 
+# Ежедневный "heartbeat" админу (проверка что бот жив + тест уведомлений)
+ADMIN_HEARTBEAT_HOUR = int(os.environ.get("ADMIN_HEARTBEAT_HOUR", "9"))
+ADMIN_HEARTBEAT_MINUTE = int(os.environ.get("ADMIN_HEARTBEAT_MINUTE", "0"))
+ADMIN_HEARTBEAT_ERROR_LINES = int(os.environ.get("ADMIN_HEARTBEAT_ERROR_LINES", "10"))
+RECENT_ERROR_LOGS_MAXLEN = int(os.environ.get("RECENT_ERROR_LOGS_MAXLEN", "50"))
+
 # Проверяем обязательные переменные
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не установлен в переменных окружения")
@@ -57,7 +65,85 @@ def now_local():
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
+BOT_START_TS = time.time()
+
+# Буфер последних ERROR-логов (в памяти), чтобы отправлять их админу в daily heartbeat.
+RECENT_ERROR_RECORDS = deque(maxlen=RECENT_ERROR_LOGS_MAXLEN)
+
+
+class RecentErrorBufferHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            if record.levelno < logging.ERROR:
+                return
+            msg = self.format(record)
+            RECENT_ERROR_RECORDS.append((record.created, record.levelname, msg))
+        except Exception:
+            # Нельзя падать из-за логирования
+            pass
+
+
+_recent_error_handler = RecentErrorBufferHandler(level=logging.ERROR)
+_recent_error_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+)
+logging.getLogger().addHandler(_recent_error_handler)
+
+
+def _format_uptime(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if days:
+        return f"{days}д {hours:02d}ч {minutes:02d}м {seconds:02d}с"
+    return f"{hours:02d}ч {minutes:02d}м {seconds:02d}с"
+
+
+def _get_recent_error_text(now: datetime, max_lines: int) -> str:
+    # Берём последние max_lines ошибок, и ещё считаем сколько было за последние 24 часа
+    now_ts = now.timestamp()
+    last_24h = [r for r in list(RECENT_ERROR_RECORDS) if now_ts - r[0] <= 24 * 3600]
+    tail = list(RECENT_ERROR_RECORDS)[-max_lines:]
+
+    if not tail:
+        return "Ошибок (ERROR) в буфере нет."
+
+    # Телеграм HTML: экранируем
+    lines = "\n".join(html.escape(r[2]) for r in tail)
+    return f"Ошибок за 24ч: {len(last_24h)}\n\n<pre>{lines}</pre>"
+
+
+def send_admin_daily_heartbeat(now: datetime | None = None):
+    now = now or now_local()
+    uptime = _format_uptime(time.time() - BOT_START_TS)
+    bot_username = getattr(ME, "username", "") if "ME" in globals() else ""
+    thread_count = threading.active_count()
+
+    text = (
+        f"✅ Ежедневный статус бота\n"
+        f"🕒 Время: {now.strftime('%d.%m.%Y %H:%M:%S')} ({LOCAL_TZ.zone})\n"
+        f"🤖 Бот: @{bot_username}\n"
+        f"⏱ Аптайм: {uptime}\n"
+        f"🧵 Потоки: {thread_count}\n\n"
+        f"🧾 Последние ошибки:\n{_get_recent_error_text(now, ADMIN_HEARTBEAT_ERROR_LINES)}"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            safe_send_message(admin_id, text, parse_mode="HTML")
+        except Exception:
+            logging.exception(f"❌ Error sending daily heartbeat to admin {admin_id}")
+
+
+# По умолчанию у TeleBot небольшой пул потоков. При сетевых/БД операциях в хендлерах
+# это легко даёт очередь и ощущение, что бот "отвечает через несколько секунд".
+BOT_NUM_THREADS = int(os.environ.get("BOT_NUM_THREADS", "8"))
+try:
+    bot = telebot.TeleBot(BOT_TOKEN, threaded=True, num_threads=BOT_NUM_THREADS)
+except TypeError:
+    # На случай старой версии pyTelegramBotAPI без параметра num_threads
+    bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
 
 try:
     ME = bot.get_me()
@@ -482,8 +568,8 @@ def create_chat_invite_link_one_time(
 
 
 def get_bot_invite_link():
-    username = bot.get_me().username
-    return f"https://t.me/{username}?startgroup=true"
+    # bot.get_me() — сетевой вызов. Используем кэш, полученный при старте.
+    return f"https://t.me/{ME.username}?startgroup=true"
 
 
 def is_bot_admin_in_chat(chat_id):
@@ -601,35 +687,37 @@ def can_user_pay_partial(user_id, plan_id):
 
 def activate_subscription(user_id, plan_id, payment_type="full", group_id=None):
     """Активирует или продлевает подписку для пользователя с учетом типа оплаты"""
+    # 1) Быстрые чтения из БД — под lock
     with db_lock:
         cursor.execute(
             "SELECT price_cents, title, group_id FROM plans WHERE id=?", (plan_id,)
         )
         plan = cursor.fetchone()
-        if not plan:
-            return False, "Тариф не найден"
 
-        price_cents, plan_title, plan_group_id = plan
-        current_month, current_year = get_current_period()
+    if not plan:
+        return False, "Тариф не найден"
 
-        target_group_id = plan_group_id if plan_group_id else group_id
-        if not target_group_id:
-            return False, "Не указана группа для подписки"
+    price_cents, plan_title, plan_group_id = plan
+    current_month, current_year = get_current_period()
 
-        try:
-            # Пробуем разбанить пользователя, если он забанен
-            bot.unban_chat_member(target_group_id, user_id)
-            logging.info(
-                f"🔄 Попытка разбанить пользователя {user_id} в группе {target_group_id}"
-            )
-        except Exception as e:
-            # Ошибка может быть если пользователь не забанен или бот не админ
-            logging.debug(f"⚠️ Не удалось разбанить пользователя {user_id}: {e}")
+    target_group_id = plan_group_id if plan_group_id else group_id
+    if not target_group_id:
+        return False, "Не указана группа для подписки"
 
-        start_ts = int(time.time())
-        now = now_local()
+    # 2) Telegram API — всегда вне db_lock
+    try:
+        bot.unban_chat_member(target_group_id, user_id)
+        logging.info(
+            f"🔄 Попытка разбанить пользователя {user_id} в группе {target_group_id}"
+        )
+    except Exception as e:
+        logging.debug(f"⚠️ Не удалось разбанить пользователя {user_id}: {e}")
 
-        # Проверяем, есть ли уже активная подписка для этого пользователя и тарифа
+    start_ts = int(time.time())
+    now = now_local()
+
+    # 3) Достаём текущую активную подписку — под lock
+    with db_lock:
         cursor.execute(
             """
             SELECT id, part_paid, current_period_month, current_period_year, end_ts 
@@ -640,30 +728,28 @@ def activate_subscription(user_id, plan_id, payment_type="full", group_id=None):
         """,
             (user_id, plan_id),
         )
-
         existing_sub = cursor.fetchone()
 
-        existing_end_ts = start_ts
-        existing_month = current_month
-        existing_year = current_year
+    existing_end_ts = start_ts
+    existing_month = current_month
+    existing_year = current_year
 
-        # Если есть активная подписка и мы продлеваем её
-        if existing_sub:
-            (
-                sub_id,
-                existing_part_paid,
-                existing_month,
-                existing_year,
-                existing_end_ts,
-            ) = existing_sub
+    if existing_sub:
+        (
+            sub_id,
+            existing_part_paid,
+            existing_month,
+            existing_year,
+            existing_end_ts,
+        ) = existing_sub
 
-            # Если подписка уже оплачена за текущий месяц полностью
-            if (
-                existing_part_paid == "full"
-                and existing_month == current_month
-                and existing_year == current_year
-            ):
-                # Находим последнюю неактивную подписку для продления
+        # Если подписка уже оплачена за текущий месяц полностью — пробуем найти неактивную для продления
+        if (
+            existing_part_paid == "full"
+            and existing_month == current_month
+            and existing_year == current_year
+        ):
+            with db_lock:
                 cursor.execute(
                     """
                     SELECT id, end_ts 
@@ -674,118 +760,94 @@ def activate_subscription(user_id, plan_id, payment_type="full", group_id=None):
                 """,
                     (user_id, plan_id),
                 )
-
                 inactive_sub = cursor.fetchone()
-                if inactive_sub:
-                    sub_id = inactive_sub[0]
-                    existing_end_ts = inactive_sub[1]
-                else:
-                    # Создаем новую запись для продления
-                    existing_end_ts = start_ts
-            # Если есть первая часть и доплачиваем вторую
-            elif (
-                existing_part_paid == "first"
-                and existing_month == current_month
-                and existing_year == current_year
-            ):
-                if payment_type in ("second_part", "second_part_late", "full"):
-                    # Обновляем существующую запись
-                    pass
 
-        # НОВАЯ ЛОГИКА: для подключения после 21 числа
-        if payment_type == "half_month":
-            # Половина месяца - доступ до 5 числа следующего месяца
+            if inactive_sub:
+                existing_end_ts = inactive_sub[1]
+            else:
+                existing_end_ts = start_ts
+        elif (
+            existing_part_paid == "first"
+            and existing_month == current_month
+            and existing_year == current_year
+        ):
+            if payment_type in ("second_part", "second_part_late", "full"):
+                pass
+
+    # 4) Расчёт сроков — вне lock
+    if payment_type == "half_month":
+        if now.month == 12:
+            next_month = 1
+            next_year = now.year + 1
+        else:
+            next_month = now.month + 1
+            next_year = now.year
+        end_dt = LOCAL_TZ.localize(datetime(next_year, next_month, 5, 23, 59, 59))
+        end_ts = int(end_dt.timestamp())
+        part_paid = "full"
+
+    elif payment_type in ("full", "full_anytime"):
+        if existing_sub and existing_end_ts > start_ts:
             if now.month == 12:
                 next_month = 1
                 next_year = now.year + 1
             else:
                 next_month = now.month + 1
                 next_year = now.year
-            end_dt = LOCAL_TZ.localize(datetime(next_year, next_month, 5, 23, 59, 59))
-            end_ts = int(end_dt.timestamp())
-            part_paid = "full"  # Считаем как полную оплату за оставшийся период
-
-        # Рассчитываем end_ts в зависимости от типа оплаты
-        elif payment_type in ("full", "full_anytime"):
-            # Полная оплата - доступ до 5 числа следующего месяца
-            if existing_sub and existing_end_ts > start_ts:
-                # Если есть действующая подписка, продлеваем её
-                if now.month == 12:
-                    next_month = 1
-                    next_year = now.year + 1
-                else:
-                    next_month = now.month + 1
-                    next_year = now.year
-            else:
-                # Новая подписка
-                if now.month == 12:
-                    next_month = 1
-                    next_year = now.year + 1
-                else:
-                    next_month = now.month + 1
-                    next_year = now.year
-
-            end_dt = LOCAL_TZ.localize(datetime(next_year, next_month, 5, 23, 59, 59))
-            end_ts = int(end_dt.timestamp())
-            part_paid = "full"
-
-        elif payment_type == "partial":
-            # Первая часть - доступ до 15 числа текущего месяца
-            end_dt = LOCAL_TZ.localize(datetime(now.year, now.month, 15, 23, 59, 59))
-            end_ts = int(end_dt.timestamp())
-            part_paid = "first"
-
-        elif payment_type in ("second_part", "second_part_late"):
-            # Вторая часть (вовремя или поздно) - доступ до 5 числа следующего месяца
+        else:
             if now.month == 12:
                 next_month = 1
                 next_year = now.year + 1
             else:
                 next_month = now.month + 1
                 next_year = now.year
-            end_dt = LOCAL_TZ.localize(datetime(next_year, next_month, 5, 23, 59, 59))
-            end_ts = int(end_dt.timestamp())
-            part_paid = "full"
 
-        # Всегда генерируем новую ссылку
-        invite_link = create_chat_invite_link_one_time(
-            BOT_TOKEN, target_group_id, expire_seconds=7 * 24 * 3600, member_limit=1
-        )
+        end_dt = LOCAL_TZ.localize(datetime(next_year, next_month, 5, 23, 59, 59))
+        end_ts = int(end_dt.timestamp())
+        part_paid = "full"
 
-        if not invite_link:
-            logging.error(f"Не удалось создать ссылку для группы {target_group_id}")
-            return False, "Не удалось создать пригласительную ссылку"
+    elif payment_type == "partial":
+        end_dt = LOCAL_TZ.localize(datetime(now.year, now.month, 15, 23, 59, 59))
+        end_ts = int(end_dt.timestamp())
+        part_paid = "first"
 
+    elif payment_type in ("second_part", "second_part_late"):
+        if now.month == 12:
+            next_month = 1
+            next_year = now.year + 1
+        else:
+            next_month = now.month + 1
+            next_year = now.year
+        end_dt = LOCAL_TZ.localize(datetime(next_year, next_month, 5, 23, 59, 59))
+        end_ts = int(end_dt.timestamp())
+        part_paid = "full"
+
+    # 5) Генерация ссылки — сетевой запрос, строго вне db_lock
+    invite_link = create_chat_invite_link_one_time(
+        BOT_TOKEN, target_group_id, expire_seconds=7 * 24 * 3600, member_limit=1
+    )
+
+    if not invite_link:
+        logging.error(f"Не удалось создать ссылку для группы {target_group_id}")
+        return False, "Не удалось создать пригласительную ссылку"
+
+    # 6) Запись результата в БД — одной транзакцией под lock
+    with db_lock:
         if (
             existing_sub
             and existing_sub[2] == current_month
             and existing_sub[3] == current_year
         ):
-            # Обновляем существующую подписку на ТЕКУЩИЙ период
             sub_id = existing_sub[0]
-
-            # Если обновляем первую часть на полную (доплачиваем вторую)
-            if existing_sub[1] == "first" and part_paid == "full":
-                cursor.execute(
-                    """
-                    UPDATE subscriptions 
-                    SET payment_type=?, part_paid=?, end_ts=?, invite_link=?, active=1, removed=0
-                    WHERE id=?
-                """,
-                    (payment_type, part_paid, end_ts, invite_link, sub_id),
-                )
-            else:
-                # Для других случаев
-                cursor.execute(
-                    """
-                    UPDATE subscriptions 
-                    SET payment_type=?, part_paid=?, end_ts=?, invite_link=?, active=1, removed=0
-                    WHERE id=?
-                """,
-                    (payment_type, part_paid, end_ts, invite_link, sub_id),
-                )
+            cursor.execute(
+                """
+                UPDATE subscriptions 
+                SET payment_type=?, part_paid=?, end_ts=?, invite_link=?, active=1, removed=0
+                WHERE id=?
+            """,
+                (payment_type, part_paid, end_ts, invite_link, sub_id),
+            )
         elif existing_sub:
-            # Продлеваем существующую подписку (обновляем период и срок)
             sub_id = existing_sub[0]
             cursor.execute(
                 """
@@ -805,7 +867,6 @@ def activate_subscription(user_id, plan_id, payment_type="full", group_id=None):
                 ),
             )
         else:
-            # Создаем новую подписку
             cursor.execute(
                 """
                 INSERT INTO subscriptions (user_id, plan_id, start_ts, end_ts, invite_link, active, removed, group_id, 
@@ -829,7 +890,7 @@ def activate_subscription(user_id, plan_id, payment_type="full", group_id=None):
 
         conn.commit()
 
-        return True, invite_link
+    return True, invite_link
 
 
 @bot.callback_query_handler(
@@ -2228,8 +2289,8 @@ def show_balance(message):
 @only_private
 def show_ref(message):
     uid = message.from_user.id
-    bot_username = bot.get_me().username
-    link = f"https://t.me/{bot_username}?start=ref{uid}"
+    # bot.get_me() — сетевой вызов. Используем кэш, полученный при старте.
+    link = f"https://t.me/{ME.username}?start=ref{uid}"
     bot.send_message(
         message.chat.id,
         f"👥 Ваша реферальная ссылка:\n\n{link}\n\n💡 Делитесь и получайте {REFERRAL_PERCENT}% кэшбэка!",
@@ -5698,15 +5759,16 @@ def send_second_deadline_notifications(now):
 def update_notification_timestamp(user_id):
     """Обновляет время последнего уведомления"""
     try:
-        cursor.execute(
-            """
-            UPDATE subscriptions 
-            SET last_notification_ts = ? 
-            WHERE user_id = ? AND active = 1
-        """,
-            (int(time.time()), user_id),
-        )
-        conn.commit()
+        with db_lock:
+            cursor.execute(
+                """
+                UPDATE subscriptions 
+                SET last_notification_ts = ? 
+                WHERE user_id = ? AND active = 1
+            """,
+                (int(time.time()), user_id),
+            )
+            conn.commit()
     except Exception as e:
         logging.error(
             f"❌ Error updating notification timestamp for user {user_id}: {e}"
@@ -5777,6 +5839,7 @@ def safe_send_message(chat_id, text, **kwargs):
 def notification_worker():
     """Фоновый поток для проверки и отправки уведомлений"""
     last_check_date = None
+    last_admin_heartbeat_date = None
 
     while True:
         try:
@@ -5799,6 +5862,26 @@ def notification_worker():
             # Вызываем функцию уведомлений
             send_payment_notifications()
 
+            # Ежедневный heartbeat админу (тест системы уведомлений)
+            try:
+                heartbeat_dt = LOCAL_TZ.localize(
+                    datetime(
+                        now.year,
+                        now.month,
+                        now.day,
+                        ADMIN_HEARTBEAT_HOUR,
+                        ADMIN_HEARTBEAT_MINUTE,
+                        0,
+                    )
+                )
+                if now >= heartbeat_dt and last_admin_heartbeat_date != current_date:
+                    send_admin_daily_heartbeat(now)
+                    last_admin_heartbeat_date = current_date
+            except Exception:
+                logging.exception(
+                    "❌ Error while preparing/sending admin daily heartbeat"
+                )
+
             # Ждем 60 секунд между проверками
             time.sleep(60)
 
@@ -5814,20 +5897,20 @@ def callback_pay_second_part(call):
         user_id = call.from_user.id
 
         # Находим активные подписки пользователя, ожидающие вторую часть
-        cursor.execute(
-            """
-            SELECT s.plan_id, p.title 
-            FROM subscriptions s
-            JOIN plans p ON s.plan_id = p.id
-            WHERE s.user_id = ? AND s.active = 1 AND s.payment_type = 'partial' 
-            AND s.part_paid = 'first'
-            AND s.current_period_month = ? AND s.current_period_year = ?
-            LIMIT 1
-        """,
-            (user_id, *get_current_period()),
-        )
-
-        subscription = cursor.fetchone()
+        with db_lock:
+            cursor.execute(
+                """
+                SELECT s.plan_id, p.title 
+                FROM subscriptions s
+                JOIN plans p ON s.plan_id = p.id
+                WHERE s.user_id = ? AND s.active = 1 AND s.payment_type = 'partial' 
+                AND s.part_paid = 'first'
+                AND s.current_period_month = ? AND s.current_period_year = ?
+                LIMIT 1
+            """,
+                (user_id, *get_current_period()),
+            )
+            subscription = cursor.fetchone()
 
         if not subscription:
             bot.answer_callback_query(
@@ -5856,17 +5939,17 @@ def callback_get_link(call):
         sub_id = int(call.data.split(":")[1])
         user_id = call.from_user.id
 
-        cursor.execute(
-            """
-            SELECT s.invite_link, p.title, s.end_ts, s.active
-            FROM subscriptions s
-            LEFT JOIN plans p ON s.plan_id = p.id
-            WHERE s.id = ? AND s.user_id = ?
-        """,
-            (sub_id, user_id),
-        )
-
-        subscription = cursor.fetchone()
+        with db_lock:
+            cursor.execute(
+                """
+                SELECT s.invite_link, p.title, s.end_ts, s.active
+                FROM subscriptions s
+                LEFT JOIN plans p ON s.plan_id = p.id
+                WHERE s.id = ? AND s.user_id = ?
+            """,
+                (sub_id, user_id),
+            )
+            subscription = cursor.fetchone()
 
         if not subscription:
             bot.answer_callback_query(call.id, "❌ Подписка не найдена")
@@ -5879,23 +5962,59 @@ def callback_get_link(call):
             return
 
         if not invite_link:
-            # Генерируем новую ссылку
-            cursor.execute("SELECT group_id FROM subscriptions WHERE id = ?", (sub_id,))
-            group_id = cursor.fetchone()[0]
-            new_link = create_chat_invite_link_one_time(
-                BOT_TOKEN, group_id, expire_seconds=7 * 24 * 3600, member_limit=1
-            )
+            # Создание ссылки — сетевой запрос (вплоть до timeout=10). Не держим callback.
+            bot.answer_callback_query(call.id, "⏳ Генерирую ссылку...")
+            chat_id = call.message.chat.id
 
-            if new_link:
-                cursor.execute(
-                    "UPDATE subscriptions SET invite_link = ? WHERE id = ?",
-                    (new_link, sub_id),
-                )
-                conn.commit()
-                invite_link = new_link
-            else:
-                bot.answer_callback_query(call.id, "❌ Не удалось создать ссылку")
-                return
+            def _worker_generate_link():
+                try:
+                    with db_lock:
+                        cursor.execute(
+                            "SELECT group_id FROM subscriptions WHERE id = ?", (sub_id,)
+                        )
+                        row = cursor.fetchone()
+                    group_id = row[0] if row else None
+
+                    if not group_id:
+                        safe_send_message(
+                            chat_id, "❌ Не найдена группа для этой подписки"
+                        )
+                        return
+
+                    new_link = create_chat_invite_link_one_time(
+                        BOT_TOKEN,
+                        group_id,
+                        expire_seconds=7 * 24 * 3600,
+                        member_limit=1,
+                    )
+
+                    if not new_link:
+                        safe_send_message(chat_id, "❌ Не удалось создать ссылку")
+                        return
+
+                    with db_lock:
+                        cursor.execute(
+                            "UPDATE subscriptions SET invite_link = ? WHERE id = ?",
+                            (new_link, sub_id),
+                        )
+                        conn.commit()
+
+                    text = (
+                        f"🔗 <b>Ссылка для группы '{plan_title}'</b>\n\n"
+                        f"{new_link}\n\n"
+                        f"⚠️ Ссылка одноразовая, действует 7 дней"
+                    )
+                    safe_send_message(chat_id, text, parse_mode="HTML")
+
+                except Exception:
+                    logging.exception("Error in get_link worker")
+                    try:
+                        safe_send_message(chat_id, "❌ Ошибка получения ссылки")
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_worker_generate_link, daemon=True).start()
+            return
 
         text = (
             f"🔗 <b>Ссылка для группы '{plan_title}'</b>\n\n"
@@ -5925,7 +6044,12 @@ def callback_show_plans_notification(call):
 # ----------------- Expiration and cleanup system -----------------
 def check_expirations_loop():
     """Проверяет истечение сроков оплаты и удаляет неуплативших"""
-    last_check_date = None  # Храним последнюю дату проверки
+    # Важно: этот воркер крутится каждую минуту. Любые "ежедневные" действия
+    # должны выполняться строго один раз на дату, иначе в течение часа они
+    # будут повторяться и создавать нагрузку/задержки.
+    last_run_day6 = None
+    last_run_day21 = None
+    last_run_daily = None
 
     while True:
         try:
@@ -5933,12 +6057,9 @@ def check_expirations_loop():
             current_date = now.date()
             current_month, current_year = get_current_period()
 
-            # Проверяем только если дата изменилась (один раз в день)
-            if last_check_date != current_date:
-                last_check_date = current_date
-
-            # 6-го числа - удаляем тех, кто вообще не оплатил
-            if now.day == 6 and now.hour == 0 and last_check_date == current_date:
+            # 6-го числа - удаляем тех, кто вообще не оплатил (1 раз в дату)
+            if now.day == 6 and now.hour == 0 and last_run_day6 != current_date:
+                last_run_day6 = current_date
                 logging.info(
                     "🔄 Проверка экспирации: удаление неплативших пользователей"
                 )
@@ -5980,18 +6101,18 @@ def check_expirations_loop():
                                 logging.info(
                                     f"👤 Удален пользователь {username or user_id} из группы {group_id}"
                                 )
-                                time.sleep(0.1)
                             except Exception as e:
                                 logging.warning(
                                     f"❌ Не удалось удалить пользователя {user_id} из группы {group_id}: {e}"
                                 )
 
                         # Деактивируем подписку
-                        cursor.execute(
-                            "UPDATE subscriptions SET active = 0, removed = 1 WHERE id = ?",
-                            (sub_id,),
-                        )
-                        conn.commit()
+                        with db_lock:
+                            cursor.execute(
+                                "UPDATE subscriptions SET active = 0, removed = 1 WHERE id = ?",
+                                (sub_id,),
+                            )
+                            conn.commit()
 
                         # Уведомляем пользователя
                         try:
@@ -6015,7 +6136,8 @@ def check_expirations_loop():
                         )
 
             # 21-го числа - удаляем тех, кто оплатил только первую часть
-            elif now.day == 21 and now.hour == 0:
+            elif now.day == 21 and now.hour == 0 and last_run_day21 != current_date:
+                last_run_day21 = current_date
                 logging.info(
                     "🔄 Проверка экспирации: удаление пользователей с частичной оплатой"
                 )
@@ -6058,7 +6180,6 @@ def check_expirations_loop():
                                 logging.info(
                                     f"👤 Удален пользователь {username or user_id} из группы {group_id} (частичная оплата)"
                                 )
-                                time.sleep(0.1)
                             except Exception as e:
                                 logging.warning(
                                     f"❌ Не удалось удалить пользователя {user_id} из группы {group_id}: {e}"
@@ -6094,21 +6215,22 @@ def check_expirations_loop():
                         )
 
             # Ежедневно проверяем истекшие подписки (на всякий случай)
-            elif now.hour == 1:  # Каждый день в 01:00
+            elif now.hour == 1 and last_run_daily != current_date:  # 1 раз в дату
+                last_run_daily = current_date
                 logging.info("🔄 Ежедневная проверка истекших подписок")
 
-                cursor.execute(
-                    """
-                    SELECT s.id, s.user_id, s.group_id, s.plan_id, p.title, u.username
-                    FROM subscriptions s
-                    JOIN plans p ON s.plan_id = p.id
-                    JOIN users u ON s.user_id = u.user_id
-                    WHERE s.active = 1 AND s.end_ts < ?
-                """,
-                    (int(time.time()),),
-                )
-
-                expired_subs = cursor.fetchall()
+                with db_lock:
+                    cursor.execute(
+                        """
+                        SELECT s.id, s.user_id, s.group_id, s.plan_id, p.title, u.username
+                        FROM subscriptions s
+                        JOIN plans p ON s.plan_id = p.id
+                        JOIN users u ON s.user_id = u.user_id
+                        WHERE s.active = 1 AND s.end_ts < ?
+                    """,
+                        (int(time.time()),),
+                    )
+                    expired_subs = cursor.fetchall()
 
                 if expired_subs:
                     logging.info(
@@ -6135,18 +6257,18 @@ def check_expirations_loop():
                                     logging.info(
                                         f"👤 Удален пользователь {username or user_id} из группы {group_id} (истек срок)"
                                     )
-                                    time.sleep(0.1)
                                 except Exception as e:
                                     logging.warning(
                                         f"❌ Не удалось удалить пользователя {user_id} из группы {group_id}: {e}"
                                     )
 
                             # Деактивируем подписку
-                            cursor.execute(
-                                "UPDATE subscriptions SET active = 0, removed = 1 WHERE id = ?",
-                                (sub_id,),
-                            )
-                            conn.commit()
+                            with db_lock:
+                                cursor.execute(
+                                    "UPDATE subscriptions SET active = 0, removed = 1 WHERE id = ?",
+                                    (sub_id,),
+                                )
+                                conn.commit()
 
                         except Exception as e:
                             logging.error(
@@ -7094,8 +7216,9 @@ def cmd_send_test_notifications(message):
                         )
                     )
 
-                bot.send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
-                time.sleep(1)  # Пауза между сообщениями
+                # Важно: не блокируем worker-потоки TeleBot длительными sleep'ами.
+                # Для троттлинга используем safe_send_message (50ms) и/или лимиты Telegram.
+                safe_send_message(user_id, text, parse_mode="HTML", reply_markup=markup)
 
             logging.info(f"✅ Test notifications sent to user {user_id}")
 
