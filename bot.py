@@ -129,11 +129,21 @@ def send_admin_daily_heartbeat(now: datetime | None = None):
         f"🧾 Последние ошибки:\n{_get_recent_error_text(now, ADMIN_HEARTBEAT_ERROR_LINES)}"
     )
 
+    sent_count = 0
     for admin_id in ADMIN_IDS:
         try:
-            safe_send_message(admin_id, text, parse_mode="HTML")
-        except Exception:
-            logging.exception(f"❌ Error sending daily heartbeat to admin {admin_id}")
+            result = safe_send_message(admin_id, text, parse_mode="HTML")
+            if result:
+                sent_count += 1
+        except Exception as e:
+            logging.warning(
+                f"⚠️ Could not send daily heartbeat to admin {admin_id}: {e}"
+            )
+
+    if sent_count > 0:
+        logging.info(f"✅ Daily heartbeat sent to {sent_count}/{len(ADMIN_IDS)} admins")
+    else:
+        logging.warning(f"⚠️ Daily heartbeat could not be sent to any admin")
 
 
 # По умолчанию у TeleBot небольшой пул потоков. При сетевых/БД операциях в хендлерах
@@ -155,7 +165,14 @@ except Exception as e:
 
 
 # ----------------- DB init + migrations -----------------
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
+# Оптимизация SQLite для многопоточности
+conn.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging для лучшей конкурентности
+conn.execute("PRAGMA synchronous=NORMAL")  # Баланс между скоростью и надежностью
+conn.execute(
+    "PRAGMA cache_size=-64000"
+)  # 64MB кэша (отрицательное значение = килобайты)
+conn.execute("PRAGMA temp_store=MEMORY")  # Временные таблицы в памяти
 cursor = conn.cursor()
 
 # Глобальный lock для синхронизации доступа к БД из разных потоков
@@ -417,6 +434,18 @@ def init_db_and_migrate():
 
 init_db_and_migrate()
 
+# ----------------- Глобальные переменные для уведомлений и worker'ов -----------------
+# Флаги для отслеживания отправленных уведомлений
+sent_notifications = {
+    "first_of_month": set(),
+    "first_deadline_reminder": set(),
+    "second_part_start": set(),
+    "second_deadline_reminder": set(),
+}
+
+# Флаг для предотвращения повторного запуска worker'ов
+workers_started = False
+
 
 # ----------------- Helpers -----------------
 def price_str_from_cents(cents):
@@ -448,30 +477,37 @@ def safe_caption(text, limit=1024):
 
 
 def add_user_if_not_exists(user_id, referred_by=None):
+    # Проверяем существование пользователя
     with db_lock:
         cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
-        if cursor.fetchone() is None:
+        user_exists = cursor.fetchone() is not None
+
+    # Если пользователь не существует - создаем
+    if not user_exists:
+        with db_lock:
             cursor.execute(
-                "INSERT INTO users (user_id, referred_by, cashback_cents, username, join_date) VALUES (?, ?, 0, NULL, ?)",
+                "INSERT OR IGNORE INTO users (user_id, referred_by, cashback_cents, username, join_date) VALUES (?, ?, 0, NULL, ?)",
                 (user_id, referred_by, int(time.time())),
             )
             conn.commit()
-    # Обновляем username если изменился
+
+    # Обновляем username ВНЕ db_lock - это сетевой запрос!
+    # Делаем это асинхронно, чтобы не блокировать основной поток
+    # Если не получится - не критично, username можно обновить позже
     try:
+        # Получаем username из Telegram API ВНЕ блокировки БД
+        chat = bot.get_chat(user_id)
+        username = f"@{chat.username}" if chat.username else None
+
+        # Теперь быстро обновляем БД
         with db_lock:
             cursor.execute(
                 "UPDATE users SET username = ? WHERE user_id = ?",
-                (
-                    (
-                        f"@{bot.get_chat(user_id).username}"
-                        if bot.get_chat(user_id).username
-                        else None
-                    ),
-                    user_id,
-                ),
+                (username, user_id),
             )
             conn.commit()
     except Exception as e:
+        # Не критично если не удалось обновить username
         logging.debug(f"Could not update username for user {user_id}: {e}")
 
 
@@ -1446,6 +1482,7 @@ def show_bonus_program(message):
 
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
+    # Быстрый парсинг аргументов
     args = message.text.split()
     ref = None
     if len(args) > 1:
@@ -1455,7 +1492,10 @@ def cmd_start(message):
                 ref = int(token[3:])
             except:
                 ref = None
+
     user_id = message.from_user.id
+
+    # Добавляем пользователя асинхронно (не блокирует ответ)
     if ref and ref != user_id:
         add_user_if_not_exists(user_id, referred_by=ref)
         try:
@@ -5775,14 +5815,6 @@ def update_notification_timestamp(user_id):
         )
 
 
-# Флаги для отслеживания отправленных уведомлений
-sent_notifications = {
-    "first_of_month": set(),
-    "first_deadline_reminder": set(),
-    "second_part_start": set(),
-    "second_deadline_reminder": set(),
-}
-
 # Rate limiting для предотвращения 429 ошибок
 last_message_time = {}
 MESSAGE_RATE_LIMIT = 0.05  # 50ms между сообщениями (до 20 сообщений в секунду)
@@ -5790,7 +5822,7 @@ MESSAGE_RATE_LIMIT = 0.05  # 50ms между сообщениями (до 20 с�
 
 def safe_send_message(chat_id, text, **kwargs):
     """
-    Безопасная отправка сообщений с rate limiting и обработкой 429
+    Безопасная отправка сообщений с rate limiting и обработкой ошибок
     """
     global last_message_time
 
@@ -5820,6 +5852,25 @@ def safe_send_message(chat_id, text, **kwargs):
             elif e.error_code == 403:  # Forbidden (user blocked bot)
                 logging.info(f"User {chat_id} blocked the bot")
                 return None
+            elif (
+                e.error_code == 400
+            ):  # Bad Request (chat not found, user deleted, etc.)
+                error_description = str(e.result_json.get("description", ""))
+                if (
+                    "chat not found" in error_description.lower()
+                    or "user not found" in error_description.lower()
+                ):
+                    logging.info(
+                        f"Chat {chat_id} not found (user may have deleted account or blocked bot)"
+                    )
+                    return None
+                else:
+                    logging.error(
+                        f"Telegram API error {e.error_code} for chat {chat_id}: {e}"
+                    )
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(2**attempt)
             else:
                 logging.error(
                     f"Telegram API error {e.error_code} for chat {chat_id}: {e}"
@@ -5838,6 +5889,7 @@ def safe_send_message(chat_id, text, **kwargs):
 
 def notification_worker():
     """Фоновый поток для проверки и отправки уведомлений"""
+    logging.info("🔔 Notification worker thread started")
     last_check_date = None
     last_admin_heartbeat_date = None
 
@@ -5846,6 +5898,12 @@ def notification_worker():
             # Получаем текущее время
             now = now_local()
             current_date = now.date()
+
+            # Логируем каждый час для отладки
+            if now.minute == 0:
+                logging.info(
+                    f"⏰ Notification worker alive - {now.strftime('%d.%m.%Y %H:%M:%S')}"
+                )
 
             # Сбрасываем флаги при смене даты
             if last_check_date != current_date:
@@ -7234,6 +7292,63 @@ def cmd_send_test_notifications(message):
     )
 
 
+@bot.message_handler(commands=["worker_status"])
+@only_private
+def cmd_worker_status(message):
+    """Проверка статуса worker'ов и уведомлений"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        now = now_local()
+        global workers_started, sent_notifications
+
+        # Информация о потоках
+        all_threads = threading.enumerate()
+        notification_thread = None
+        expiration_thread = None
+
+        for thread in all_threads:
+            # Безопасная проверка наличия атрибута target
+            thread_target = getattr(thread, "target", None)
+            thread_name = str(thread.name)
+
+            if (
+                "notification_worker" in thread_name
+                or thread_target == notification_worker
+            ):
+                notification_thread = thread
+            elif (
+                "check_expirations_loop" in thread_name
+                or thread_target == check_expirations_loop
+            ):
+                expiration_thread = thread
+
+        status_text = (
+            f"📊 <b>Статус worker'ов</b>\n\n"
+            f"🕒 Время: {now.strftime('%d.%m.%Y %H:%M:%S')}\n"
+            f"📅 День: {now.day}, Час: {now.hour}, Минута: {now.minute}\n"
+            f"🔧 Workers started: {'✅ Да' if workers_started else '❌ Нет'}\n"
+            f"🧵 Всего потоков: {threading.active_count()}\n\n"
+            f"🔔 <b>Notification worker:</b> {'✅ Запущен' if notification_thread and notification_thread.is_alive() else '❌ НЕ работает'}\n"
+            f"⏰ <b>Expiration worker:</b> {'✅ Запущен' if expiration_thread and expiration_thread.is_alive() else '❌ НЕ работает'}\n\n"
+            f"📢 <b>Отправленные уведомления сегодня:</b>\n"
+            f"• Начало месяца (1-е число): {len(sent_notifications.get('first_of_month', set()))}\n"
+            f"• Первый дедлайн (4-е число): {len(sent_notifications.get('first_deadline_reminder', set()))}\n"
+            f"• Вторая часть (15-е число): {len(sent_notifications.get('second_part_start', set()))}\n"
+            f"• Второй дедлайн (19-е число): {len(sent_notifications.get('second_deadline_reminder', set()))}\n\n"
+            f"⏰ <b>Heartbeat настройки:</b>\n"
+            f"Час: {ADMIN_HEARTBEAT_HOUR}:00\n"
+            f"Часовой пояс: {LOCAL_TZ.zone}"
+        )
+
+        bot.send_message(message.chat.id, status_text, parse_mode="HTML")
+
+    except Exception as e:
+        logging.exception("Error in worker_status")
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+
 @bot.message_handler(commands=["test_worker"])
 @only_private
 def cmd_test_worker(message):
@@ -7259,6 +7374,77 @@ def cmd_test_worker(message):
         bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
 
 
+@bot.message_handler(commands=["test_heartbeat"])
+@only_private
+def cmd_test_heartbeat(message):
+    """Тест ежедневного отчета (heartbeat)"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    bot.send_message(message.chat.id, "🔄 Отправка тестового ежедневного отчета...")
+
+    try:
+        send_admin_daily_heartbeat()
+        bot.send_message(message.chat.id, "✅ Ежедневный отчет отправлен!")
+    except Exception as e:
+        logging.exception("Error in test_heartbeat")
+        bot.send_message(message.chat.id, f"❌ Ошибка отправки heartbeat: {e}")
+
+
+@bot.message_handler(commands=["performance"])
+@only_private
+def cmd_performance(message):
+    """Проверка производительности БД и бота"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        import psutil
+
+        process = psutil.Process()
+
+        # Измеряем время запроса к БД
+        start_time = time.time()
+        with db_lock:
+            cursor.execute("SELECT COUNT(*) FROM users")
+            user_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM subscriptions WHERE active=1")
+            active_subs = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM plans WHERE is_active=1")
+            plan_count = cursor.fetchone()[0]
+        db_time = (time.time() - start_time) * 1000  # в миллисекундах
+
+        # Информация о памяти
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+
+        # CPU
+        cpu_percent = process.cpu_percent(interval=0.1)
+
+        text = (
+            f"📊 <b>Производительность бота</b>\n\n"
+            f"⚡️ <b>База данных:</b>\n"
+            f"• Время запроса: {db_time:.2f} мс\n"
+            f"• Пользователей: {user_count}\n"
+            f"• Активных подписок: {active_subs}\n"
+            f"• Тарифов: {plan_count}\n\n"
+            f"💾 <b>Память:</b> {memory_mb:.1f} MB\n"
+            f"⚙️ <b>CPU:</b> {cpu_percent:.1f}%\n"
+            f"🧵 <b>Потоков:</b> {threading.active_count()}\n\n"
+            f"{'✅ Отлично' if db_time < 10 else '⚠️ БД медленная' if db_time < 50 else '❌ БД очень медленная'}"
+        )
+
+        bot.send_message(message.chat.id, text, parse_mode="HTML")
+    except ImportError:
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Для этой команды нужен модуль psutil\nУстановите: pip install psutil",
+        )
+    except Exception as e:
+        logging.exception("Error in performance check")
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+
 # ----------------- Graceful shutdown -----------------
 def shutdown():
     try:
@@ -7271,10 +7457,9 @@ def shutdown():
 # ----------------- Run polling -----------------
 def start_bot_with_restart():
     """Запуск бота с автоперезапуском при падении"""
+    global workers_started
     restart_attempts = 0
     max_restart_attempts = 10
-
-    workers_started = False
 
     while True:
         try:
