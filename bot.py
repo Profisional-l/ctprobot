@@ -158,15 +158,23 @@ except TypeError:
 # Сохраняем оригинальный метод answer_callback_query
 _original_answer_callback_query = bot.answer_callback_query
 
+
 def _safe_answer_callback_query_wrapper(call_id, text="", show_alert=False, **kwargs):
     """Обертка для answer_callback_query с обработкой устаревших query ID"""
     try:
-        return _original_answer_callback_query(call_id, text, show_alert=show_alert, **kwargs)
+        return _original_answer_callback_query(
+            call_id, text, show_alert=show_alert, **kwargs
+        )
     except telebot.apihelper.ApiTelegramException as e:
         if e.error_code == 400:
             error_desc = str(e.result_json.get("description", ""))
-            if "query is too old" in error_desc.lower() or "query ID is invalid" in error_desc.lower():
-                logging.debug(f"Query timeout - пользователь нажал кнопку спустя >30 сек")
+            if (
+                "query is too old" in error_desc.lower()
+                or "query ID is invalid" in error_desc.lower()
+            ):
+                logging.debug(
+                    f"Query timeout - пользователь нажал кнопку спустя >30 сек"
+                )
                 return None
         # Re-raise если это не "query too old"
         raise
@@ -174,6 +182,7 @@ def _safe_answer_callback_query_wrapper(call_id, text="", show_alert=False, **kw
         # Логируем но не падаем
         logging.error(f"Error in answer_callback_query for {call_id}")
         raise
+
 
 # Заменяем метод на обертку
 bot.answer_callback_query = _safe_answer_callback_query_wrapper
@@ -1331,16 +1340,16 @@ bot.set_update_listener(process_updates)
 def handle_api_errors(error):
     """Обработка ошибок Telegram API, особенно query timeout"""
     error_str = str(error)
-    
+
     if "query is too old" in error_str or "query ID is invalid" in error_str:
         # Это нормальная ошибка - пользователь долго ждал перед нажатием кнопки
         logging.debug(f"Query timeout: пользователь нажал кнопку спустя >30 секунд")
         return
-    
+
     if "Bad Request: chat not found" in error_str or "user not found" in error_str:
         logging.info(f"Chat/user not found: {error}")
         return
-    
+
     # Для остальных ошибок логируем
     logging.error(f"API Error: {error}")
 
@@ -5937,14 +5946,19 @@ def safe_answer_callback_query(call_id, text="", show_alert=False):
     except telebot.apihelper.ApiTelegramException as e:
         if e.error_code == 400:
             error_desc = str(e.result_json.get("description", ""))
-            if "query is too old" in error_desc.lower() or "query ID is invalid" in error_desc.lower():
+            if (
+                "query is too old" in error_desc.lower()
+                or "query ID is invalid" in error_desc.lower()
+            ):
                 # Это нормальная ошибка - пользователь долго ждал перед нажатием кнопки
-                logging.debug(f"Query timeout - пользователь долго ждал перед нажатием кнопки (>30 сек)")
+                logging.debug(
+                    f"Query timeout - пользователь долго ждал перед нажатием кнопки (>30 сек)"
+                )
                 return None
         logging.error(f"Error answering callback query {call_id}: {e}")
     except Exception as e:
         logging.error(f"Unexpected error in safe_answer_callback_query: {e}")
-    
+
     return None
 
 
@@ -6395,7 +6409,9 @@ def check_expirations_loop():
                                 f"❌ Ошибка обработки daily expired подписки {sub_id}: {e}"
                             )
 
-            time.sleep(30)  # Проверяем каждые 30 секунд (вместо 60) для более быстрой реакции
+            time.sleep(
+                30
+            )  # Проверяем каждые 30 секунд (вместо 60) для более быстрой реакции
 
         except Exception as e:
             logging.exception("❌ Критическая ошибка в check_expirations_loop")
