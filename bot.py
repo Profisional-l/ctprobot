@@ -155,6 +155,29 @@ except TypeError:
     # На случай старой версии pyTelegramBotAPI без параметра num_threads
     bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
 
+# Сохраняем оригинальный метод answer_callback_query
+_original_answer_callback_query = bot.answer_callback_query
+
+def _safe_answer_callback_query_wrapper(call_id, text="", show_alert=False, **kwargs):
+    """Обертка для answer_callback_query с обработкой устаревших query ID"""
+    try:
+        return _original_answer_callback_query(call_id, text, show_alert=show_alert, **kwargs)
+    except telebot.apihelper.ApiTelegramException as e:
+        if e.error_code == 400:
+            error_desc = str(e.result_json.get("description", ""))
+            if "query is too old" in error_desc.lower() or "query ID is invalid" in error_desc.lower():
+                logging.debug(f"Query timeout - пользователь нажал кнопку спустя >30 сек")
+                return None
+        # Re-raise если это не "query too old"
+        raise
+    except Exception:
+        # Логируем но не падаем
+        logging.error(f"Error in answer_callback_query for {call_id}")
+        raise
+
+# Заменяем метод на обертку
+bot.answer_callback_query = _safe_answer_callback_query_wrapper
+
 try:
     ME = bot.get_me()
     BOT_ID = ME.id
@@ -491,24 +514,23 @@ def add_user_if_not_exists(user_id, referred_by=None):
             )
             conn.commit()
 
-    # Обновляем username ВНЕ db_lock - это сетевой запрос!
-    # Делаем это асинхронно, чтобы не блокировать основной поток
-    # Если не получится - не критично, username можно обновить позже
-    try:
-        # Получаем username из Telegram API ВНЕ блокировки БД
-        chat = bot.get_chat(user_id)
-        username = f"@{chat.username}" if chat.username else None
+    # ВАЖНО: Обновление username делаем ТОЛЬКО в фоновом потоке, не блокируя основной!
+    # Сетевой запрос может занять 100-500мс - это убьет responsiveness
+    def update_username_async():
+        try:
+            chat = bot.get_chat(user_id)
+            username = f"@{chat.username}" if chat.username else None
+            with db_lock:
+                cursor.execute(
+                    "UPDATE users SET username = ? WHERE user_id = ?",
+                    (username, user_id),
+                )
+                conn.commit()
+        except Exception as e:
+            logging.debug(f"Could not update username for user {user_id}: {e}")
 
-        # Теперь быстро обновляем БД
-        with db_lock:
-            cursor.execute(
-                "UPDATE users SET username = ? WHERE user_id = ?",
-                (username, user_id),
-            )
-            conn.commit()
-    except Exception as e:
-        # Не критично если не удалось обновить username
-        logging.debug(f"Could not update username for user {user_id}: {e}")
+    # Запускаем в отдельном потоке - НЕ блокируя основной
+    threading.Thread(target=update_username_async, daemon=True).start()
 
 
 def get_default_group():
@@ -1302,6 +1324,25 @@ def process_updates(updates):
 
 
 bot.set_update_listener(process_updates)
+
+
+# Перехватчик ошибок для обработки устаревших query ID
+@bot.error_handler
+def handle_api_errors(error):
+    """Обработка ошибок Telegram API, особенно query timeout"""
+    error_str = str(error)
+    
+    if "query is too old" in error_str or "query ID is invalid" in error_str:
+        # Это нормальная ошибка - пользователь долго ждал перед нажатием кнопки
+        logging.debug(f"Query timeout: пользователь нажал кнопку спустя >30 секунд")
+        return
+    
+    if "Bad Request: chat not found" in error_str or "user not found" in error_str:
+        logging.info(f"Chat/user not found: {error}")
+        return
+    
+    # Для остальных ошибок логируем
+    logging.error(f"API Error: {error}")
 
 
 @bot.message_handler(commands=["debug"])
@@ -2555,10 +2596,10 @@ def callback_back_to_plans(call):
     """Возврат к списку групп"""
     try:
         show_plans(call.message)
-        bot.answer_callback_query(call.id)
+        safe_answer_callback_query(call.id)
     except Exception as e:
         logging.exception("Error in callback_back_to_plans")
-        bot.answer_callback_query(call.id, "❌ Ошибка")
+        safe_answer_callback_query(call.id, "❌ Ошибка")
 
 
 # Обработчики покупки
@@ -5887,6 +5928,26 @@ def safe_send_message(chat_id, text, **kwargs):
     return None
 
 
+def safe_answer_callback_query(call_id, text="", show_alert=False):
+    """
+    Безопасный ответ на callback query с обработкой устаревших query ID
+    """
+    try:
+        bot.answer_callback_query(call_id, text, show_alert=show_alert)
+    except telebot.apihelper.ApiTelegramException as e:
+        if e.error_code == 400:
+            error_desc = str(e.result_json.get("description", ""))
+            if "query is too old" in error_desc.lower() or "query ID is invalid" in error_desc.lower():
+                # Это нормальная ошибка - пользователь долго ждал перед нажатием кнопки
+                logging.debug(f"Query timeout - пользователь долго ждал перед нажатием кнопки (>30 сек)")
+                return None
+        logging.error(f"Error answering callback query {call_id}: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error in safe_answer_callback_query: {e}")
+    
+    return None
+
+
 def notification_worker():
     """Фоновый поток для проверки и отправки уведомлений"""
     logging.info("🔔 Notification worker thread started")
@@ -5940,12 +6001,12 @@ def notification_worker():
                     "❌ Error while preparing/sending admin daily heartbeat"
                 )
 
-            # Ждем 60 секунд между проверками
-            time.sleep(60)
+            # Ждем 5 секунд между проверками (вместо 60) для быстрой реакции
+            time.sleep(5)
 
         except Exception as e:
             logging.exception(f"❌ Error in notification worker: {e}")
-            time.sleep(60)  # Ждем минуту при ошибке
+            time.sleep(5)  # Ждем 5 сек при ошибке (вместо 60)
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "pay_second_part")
@@ -6116,6 +6177,7 @@ def check_expirations_loop():
             current_month, current_year = get_current_period()
 
             # 6-го числа - удаляем тех, кто вообще не оплатил (1 раз в дату)
+            # Проверяем экспирацию при смене часа (не только в 0:00)
             if now.day == 6 and now.hour == 0 and last_run_day6 != current_date:
                 last_run_day6 = current_date
                 logging.info(
@@ -6333,11 +6395,11 @@ def check_expirations_loop():
                                 f"❌ Ошибка обработки daily expired подписки {sub_id}: {e}"
                             )
 
-            time.sleep(60)  # Проверяем каждую минуту
+            time.sleep(30)  # Проверяем каждые 30 секунд (вместо 60) для более быстрой реакции
 
         except Exception as e:
             logging.exception("❌ Критическая ошибка в check_expirations_loop")
-            time.sleep(60)  # Ждем минуту перед повторной попыткой
+            time.sleep(10)  # Ждем 10 сек перед повторной попыткой (вместо 60)
 
 
 # Запускаем фоновые процессы (теперь при запуске)
@@ -7475,11 +7537,11 @@ def start_bot_with_restart():
 
                 workers_started = True
 
-            # ОСНОВНОЙ polling с правильными параметрами
+            # ОСНОВНОЙ polling с оптимизированными параметрами для лучшей responsiveness
             logging.info("🤖 Starting bot polling...")
             bot.infinity_polling(
-                timeout=20,
-                long_polling_timeout=15,
+                timeout=10,  # Уменьшено с 20 для более быстрого reconnect
+                long_polling_timeout=10,  # Уменьшено с 15 для более быстрого получения обновлений
                 logger_level=logging.ERROR,  # Уменьшаем логирование telebot
                 allowed_updates=[
                     "message",
