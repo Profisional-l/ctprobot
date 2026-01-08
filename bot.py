@@ -1335,23 +1335,8 @@ def process_updates(updates):
 bot.set_update_listener(process_updates)
 
 
-# Перехватчик ошибок для обработки устаревших query ID
-@bot.error_handler
-def handle_api_errors(error):
-    """Обработка ошибок Telegram API, особенно query timeout"""
-    error_str = str(error)
-
-    if "query is too old" in error_str or "query ID is invalid" in error_str:
-        # Это нормальная ошибка - пользователь долго ждал перед нажатием кнопки
-        logging.debug(f"Query timeout: пользователь нажал кнопку спустя >30 секунд")
-        return
-
-    if "Bad Request: chat not found" in error_str or "user not found" in error_str:
-        logging.info(f"Chat/user not found: {error}")
-        return
-
-    # Для остальных ошибок логируем
-    logging.error(f"API Error: {error}")
+# Примечание: обработка устаревших query ID делается в _safe_answer_callback_query_wrapper
+# которая автоматически оборачивает все вызовы bot.answer_callback_query()
 
 
 @bot.message_handler(commands=["debug"])
